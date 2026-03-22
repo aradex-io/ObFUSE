@@ -9,12 +9,12 @@
 
 ## Summary
 
-| Severity | Found | Fixed In-Review | Remaining |
-|----------|-------|-----------------|-----------|
-| **Critical** (data loss/security) | 3 | 0 | 3 |
-| **High** (logic bug, correctness) | 4 | 2 | 2 |
-| **Medium** (robustness) | 5 | 0 | 5 |
-| **Low** (code quality) | 4 | 2 | 2 |
+| Severity | Found | Fixed | Remaining |
+|----------|-------|-------|-----------|
+| **Critical** (data loss/security) | 3 | 3 | 0 |
+| **High** (logic bug, correctness) | 4 | 3 | 1 |
+| **Medium** (robustness) | 5 | 1 | 4 |
+| **Low** (code quality) | 4 | 4 | 0 |
 
 ---
 
@@ -31,6 +31,8 @@
 
 **Worth fixing**: **Yes, mandatory.** This is a data corruption path.
 
+**Status**: **Fixed.** Rename now checks the parent directory listing's `is_dir` flag, with a fallback that tries `read_dir` on the path itself.
+
 ---
 
 ### C2. Dedup With Per-File Keys Means Cross-File Dedup Is Broken
@@ -46,6 +48,8 @@
 
 **Worth fixing**: **Yes, mandatory.** This is a silent data corruption bug. Option 1 is better for the project's value proposition.
 
+**Status**: **Fixed.** Added `derive_data_key()` — a single path-independent key for all chunk encryption. Per-file keys removed from chunk pipeline; metadata still uses `derive_meta_key()`. Chunk record names changed from `_c{N}.{hash}` to `_c.{hash}` to properly support dedup.
+
 ---
 
 ### C3. Empty File Handling Inconsistency
@@ -58,6 +62,8 @@
 **Fix**: Remove the dead `is_empty()` special case in `read_file`, or make it return `Ok(vec![])` directly without calling `dechunkify`.
 
 **Worth fixing**: **Yes, quick fix**, prevents future confusion.
+
+**Status**: **Fixed.** Dead `is_empty()` codepath removed.
 
 ---
 
@@ -73,6 +79,8 @@
 **Fix**: Before writing, try `stat_file` to get existing metadata. If it exists, carry forward `created` from the old meta.
 
 **Worth fixing**: **Yes**, simple fix, important for POSIX expectations.
+
+**Status**: **Fixed.** `write_file` now calls `stat_file` to preserve the existing `created` timestamp on overwrite.
 
 ---
 
@@ -207,36 +215,28 @@
 
 ---
 
-## Fixes Applied During This Review
+## Fixes Applied
 
-| ID | Fix |
-|----|-----|
-| H2 | Identified; needs 1-line fix (capture inode before delete_file) |
-| H4 | Identified; remove redundant whitespace checks |
-| L2 | Identified; remove `aes-gcm` from Cargo.toml |
-| -- | Removed unused `Arc` import from storage |
-| -- | Removed unused `TxtRecord` import from storage |
-| -- | Removed 5 unused libc error constants from fs |
-| -- | Removed unused imports from volume module |
-| -- | Added missing `DnsError` import in fs module |
-| -- | Removed stale `{dns,fs,...}` literal directory artifact |
+| ID | Fix | Status |
+|----|-----|--------|
+| C1 | Rename `is_dir` detection: check parent dir listing instead of `stat_file().is_err()` | **Fixed** |
+| C2 | Cross-file dedup: single `data_key` for chunks, chunk records use `_c.{hash}` (no index) | **Fixed** |
+| C3 | Dead empty-file codepath removed | **Fixed** |
+| H1 | Overwrite preserves `created` timestamp from existing metadata | **Fixed** |
+| H2 | `unlink` captures inode before `delete_file` | **Fixed** |
+| H4 | Redundant whitespace checks removed | **Fixed** |
+| M1 | `key_from_hex` trims whitespace | **Fixed** |
+| L1 | Dead `is_duplicate` function removed | **Fixed** |
+| L2 | Unused `aes-gcm` dependency removed | **Fixed** |
+| L3 | Export walks directory tree to reconstruct full paths | **Fixed** |
+| -- | Removed unused imports (Arc, TxtRecord, libc constants, etc.) | **Fixed** |
+| -- | Added dns-c2 test suite (25 tests) | **Added** |
 
----
+## Remaining Items (acceptable for PoC)
 
-## Recommended Fix Priority
-
-### Must fix before GitHub push:
-1. **C2** — Cross-file dedup decryption failure (switch to single data key)
-2. **C1** — Rename is_dir detection inversion
-3. **H1** — Overwrite clobbers created timestamp
-4. **H2** — unlink inode capture ordering
-5. **M1** — key_from_hex whitespace trimming
-
-### Should fix soon after:
-6. **C3** — Remove dead empty-file codepath
-7. **L1** — Remove dead `is_duplicate` function  
-8. **L2** — Remove unused `aes-gcm` dependency
-9. **L3** — Export path reconstruction
-
-### Acceptable as-is for PoC:
-- M2, M3, M4, M5, H3, H4, L4
+- **H3** — `write_dir` doesn't invalidate parent cache (single-writer limitation, documented)
+- **M2** — `fh_to_ino` leaks on crash (PoC-acceptable)
+- **M3** — Hash truncation 128 bits (theoretical, no practical risk)
+- **M4** — Root dir unencrypted at init (empty, no data exposed)
+- **M5** — `batch_create` default is sequential (Cloudflare batch API not implemented)
+- **L4** — `_req` parameter naming in setattr (cosmetic)

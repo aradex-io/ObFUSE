@@ -7,7 +7,7 @@
 
 use crate::crypto::{self, keys, EncryptionKey};
 use crate::dns::{DnsBackend, TxtRecord};
-use crate::storage::{FileMeta, StorageError};
+use crate::storage::{DirMeta, FileMeta, StorageError, path_hash};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -197,31 +197,18 @@ pub async fn gc(
     })
 }
 
-/// Check if a record name looks like a chunk record (_c0, _c1, etc.)
+/// Check if a record name looks like a chunk record (_c.{hash}.{domain})
 fn is_chunk_record(name: &str) -> bool {
-    // Match patterns like _c0.hash.domain or _c12.hash.domain
-    if let Some(rest) = name.strip_prefix("_c") {
-        rest.chars().next().map_or(false, |c| c.is_ascii_digit())
-    } else {
-        // Also match with subdomain prefix
-        name.contains("._c") && {
-            if let Some(pos) = name.find("._c") {
-                let after = &name[pos + 3..];
-                after.chars().next().map_or(false, |c| c.is_ascii_digit())
-            } else {
-                false
-            }
-        }
-    }
+    name.starts_with("_c.") || name.contains("._c.")
 }
 
 /// Extract the content hash from a chunk record name.
-/// Format: _c{N}.{hash}.{domain} → returns hash
+/// Format: _c.{hash}.{domain} → returns hash
 fn extract_chunk_hash(name: &str, domain: &str) -> Option<String> {
     let without_domain = name.strip_suffix(&format!(".{}", domain))?;
-    // without_domain = "_c0.abcdef1234..."
-    let dot_pos = without_domain.find('.')?;
-    Some(without_domain[dot_pos + 1..].to_string())
+    // without_domain = "_c.abcdef1234..."
+    let after_prefix = without_domain.strip_prefix("_c.")?;
+    Some(after_prefix.to_string())
 }
 
 // ─── Filesystem Check ───────────────────────────────────────────────
@@ -287,7 +274,7 @@ pub async fn fsck(
 
         // Verify each referenced chunk exists
         for (i, hash) in meta.chunk_hashes.iter().enumerate() {
-            let expected_name = format!("_c{}.{}.{}", i, hash, domain);
+            let expected_name = format!("_c.{}.{}", hash, domain);
             if chunk_records.contains(&expected_name) {
                 result.chunks_verified += 1;
             } else {
@@ -374,6 +361,35 @@ pub async fn export(
         }
     }
 
+    // Walk directory tree to build path_hash → full_path mapping
+    let mut path_map: HashMap<String, String> = HashMap::new();
+    let mut dir_queue: Vec<String> = vec!["/".to_string()];
+
+    while let Some(dir_path) = dir_queue.pop() {
+        let phash = path_hash(&dir_path);
+        let dir_rname = format!("_dir.{}.{}", phash, domain);
+        if let Some(dir_record) = dir_records.get(&dir_rname) {
+            if let Ok(decrypted) = decode_encrypted(&meta_key, &dir_record.content) {
+                if let Ok(dir_meta) = serde_json::from_slice::<DirMeta>(&decrypted) {
+                    for entry in &dir_meta.entries {
+                        let child_path = if dir_path == "/" {
+                            format!("/{}", entry.name)
+                        } else {
+                            format!("{}/{}", dir_path, entry.name)
+                        };
+                        if entry.is_dir {
+                            dir_queue.push(child_path);
+                        } else {
+                            let child_phash = path_hash(&child_path);
+                            let meta_rname = format!("_meta.{}.{}", child_phash, domain);
+                            path_map.insert(meta_rname, child_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Create tar.gz output
     let file = File::create(output_path)
         .map_err(|e| StorageError::Other(format!("Cannot create {}: {}", output_path.display(), e)))?;
@@ -400,16 +416,17 @@ pub async fn export(
             }
         };
 
-        // Reconstruct file path from metadata
-        // (We only have the filename, not the full path, unless we walk dirs)
-        let file_path = meta.name.clone();
+        // Use full path from directory walk, fall back to filename only
+        let file_path = path_map.get(name)
+            .cloned()
+            .unwrap_or_else(|| meta.name.clone());
 
         // Collect and decrypt chunks
         let mut chunk_contents = Vec::new();
         let mut missing_chunks = false;
 
         for (i, hash) in meta.chunk_hashes.iter().enumerate() {
-            let chunk_rname = format!("_c{}.{}.{}", i, hash, domain);
+            let chunk_rname = format!("_c.{}.{}", hash, domain);
             match chunk_map.get(&chunk_rname) {
                 Some(encoded) => chunk_contents.push(encoded.clone()),
                 None => {
@@ -517,8 +534,8 @@ mod tests {
 
     #[test]
     fn test_is_chunk_record() {
-        assert!(is_chunk_record("_c0.abcdef.fs.test.com"));
-        assert!(is_chunk_record("_c12.abcdef.fs.test.com"));
+        assert!(is_chunk_record("_c.abcdef.fs.test.com"));
+        assert!(is_chunk_record("_c.abcdef1234.fs.test.com"));
         assert!(!is_chunk_record("_meta.abcdef.fs.test.com"));
         assert!(!is_chunk_record("_dir.abcdef.fs.test.com"));
         assert!(!is_chunk_record("_vol.fs.test.com"));
@@ -527,11 +544,11 @@ mod tests {
     #[test]
     fn test_extract_chunk_hash() {
         assert_eq!(
-            extract_chunk_hash("_c0.abcdef1234.fs.test.com", "fs.test.com"),
+            extract_chunk_hash("_c.abcdef1234.fs.test.com", "fs.test.com"),
             Some("abcdef1234".to_string())
         );
         assert_eq!(
-            extract_chunk_hash("_c5.xyz.fs.test.com", "fs.test.com"),
+            extract_chunk_hash("_c.xyz.fs.test.com", "fs.test.com"),
             Some("xyz".to_string())
         );
     }

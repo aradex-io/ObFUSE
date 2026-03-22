@@ -154,7 +154,7 @@ fn truncate_hash(hash: &str) -> &str {
     &hash[..HASH_LABEL_LEN.min(hash.len())]
 }
 
-fn path_hash(path: &str) -> String {
+pub fn path_hash(path: &str) -> String {
     let full = crypto::content_hash(path.as_bytes());
     truncate_hash(&full).to_string()
 }
@@ -217,7 +217,7 @@ impl DnfsStorage {
     }
 
     fn meta_key(&self) -> EncryptionKey { keys::derive_meta_key(&self.master_key) }
-    fn file_key(&self, path: &str) -> EncryptionKey { keys::derive_file_key(&self.master_key, path) }
+    fn data_key(&self) -> EncryptionKey { keys::derive_data_key(&self.master_key) }
 
     fn record_name(&self, prefix: &str, hash: &str) -> String {
         format!("{}.{}.{}", prefix, hash, self.domain)
@@ -322,7 +322,7 @@ impl DnfsStorage {
         // Build all record names upfront
         let record_names: Vec<(usize, String)> = chunk_hashes
             .iter()
-            .map(|(i, h)| (*i, format!("_c{}.{}.{}", i, h, domain)))
+            .map(|(i, h)| (*i, format!("_c.{}.{}", h, domain)))
             .collect();
 
         // Fetch in parallel batches
@@ -395,7 +395,7 @@ impl DnfsStorage {
                 continue;
             }
 
-            let rname = self.record_name(&format!("_c{}", c.index), label);
+            let rname = self.record_name("_c", label);
             to_create.push((rname, c.encoded.clone()));
             self.known_chunks.insert(label.to_string());
         }
@@ -424,7 +424,8 @@ impl DnfsStorage {
             return Err(StorageError::FileTooLarge { size: data.len(), max: self.config.max_file_size });
         }
 
-        let file_key = self.file_key(path);
+        // Use path-independent data key for chunks so cross-file dedup works
+        let file_key = self.data_key();
         let content_hash = crypto::content_hash(data);
 
         let chunks = chunk::chunkify(data, &file_key)
@@ -435,13 +436,18 @@ impl DnfsStorage {
         // Coalesced batch write
         let chunk_hashes = self.write_chunks_coalesced(&chunks)?;
 
+        // Preserve original creation timestamp on overwrite
+        let created = self.stat_file(path)
+            .map(|m| m.created)
+            .unwrap_or_else(|_| now_epoch());
+
         let meta = FileMeta {
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
             size: data.len() as u64,
             mode: 0o644,
             chunk_count: chunks.len() as u32,
             chunk_hashes,
-            created: now_epoch(),
+            created,
             modified: now_epoch(),
             content_hash: truncate_hash(&content_hash).to_string(),
         };
@@ -475,7 +481,8 @@ impl DnfsStorage {
 
     /// Read file — fetches metadata then all chunks in parallel
     pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>, StorageError> {
-        let file_key = self.file_key(path);
+        // Use path-independent data key for chunks so cross-file dedup works
+        let file_key = self.data_key();
         let file_meta = self.stat_file(path)?;
 
         info!("Reading {} ({} bytes, {} chunks)", path, file_meta.size, file_meta.chunk_count);

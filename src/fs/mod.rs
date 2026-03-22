@@ -598,8 +598,17 @@ impl Filesystem for DnfsFilesystem {
 
         info!("rename: {} → {}", old_path, new_path);
 
-        // Determine if it's a file or directory
-        let is_dir = self.store.stat_file(&old_path).is_err();
+        // Determine if it's a file or directory by checking the parent directory listing.
+        // Previous approach (stat_file().is_err()) was inverted: DNS errors or missing files
+        // would incorrectly be treated as directories.
+        let is_dir = match self.store.read_dir(&old_parent_path) {
+            Ok(dir) => dir.entries.iter().any(|e| e.name == name_str && e.is_dir),
+            Err(_) => {
+                // Can't read parent dir — fall back to trying stat_file (it's a file if it exists)
+                self.store.stat_file(&old_path).is_err()
+                    && self.store.read_dir(&old_path).is_ok()
+            }
+        };
 
         if is_dir {
             // For directories: rename the dir record

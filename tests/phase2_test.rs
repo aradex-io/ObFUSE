@@ -4,6 +4,7 @@
 /// mount state rebuild, metadata caching, and overwrite behavior.
 
 use dnfs::crypto;
+use dnfs::dns::DnsBackend;
 use dnfs::dns::mock::MockDnsBackend;
 use dnfs::storage::{DirEntry, DnfsStorage, StorageConfig, StorageError};
 
@@ -319,6 +320,7 @@ fn test_config_accessible() {
         max_file_size: 32768,
         recover_corrupt: false,
         rebuild_on_mount: false,
+        ..StorageConfig::default()
     };
     let (store, _, _) = make_storage_with_config(config);
 

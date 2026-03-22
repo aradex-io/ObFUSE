@@ -4,6 +4,7 @@
 /// nuke full deletion, and export archive generation.
 
 use dnfs::crypto;
+use dnfs::dns::DnsBackend;
 use dnfs::dns::mock::MockDnsBackend;
 use dnfs::storage::{DirEntry, DnfsStorage, StorageConfig};
 use dnfs::volume;
@@ -137,7 +138,7 @@ fn test_fsck_detects_missing_chunk() {
     rt.block_on(async {
         let all = mock.list_records("fs.test.dnfs").await.unwrap();
         for r in &all {
-            if r.name.contains("_c0.") {
+            if r.name.starts_with("_c.") {
                 if let Some(ref id) = r.id {
                     mock.delete_record(id).await.unwrap();
                     break;
