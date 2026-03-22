@@ -1,8 +1,8 @@
-*.o
-*.d
-obfuse
+/target
+Cargo.lock
 *.swp
 *.swo
 *~
-.vscode/
-.idea/
+dnfs-records.json
+dnfs-export.tar.gz
+.env
