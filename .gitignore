@@ -1,0 +1,8 @@
+*.o
+*.d
+obfuse
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
