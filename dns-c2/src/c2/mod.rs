@@ -439,13 +439,13 @@ pub async fn wait_for_response(
 }
 
 pub fn generate_task_id() -> String {
-    let mut bytes = [0u8; 6];
+    let mut bytes = [0u8; 16]; // 128-bit — resistant to brute-force
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex::encode(bytes)
 }
 
 pub fn generate_session_id() -> String {
-    let mut bytes = [0u8; 6];
+    let mut bytes = [0u8; 16]; // 128-bit — resistant to brute-force
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex::encode(bytes)
 }

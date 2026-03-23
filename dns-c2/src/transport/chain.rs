@@ -53,9 +53,9 @@ impl TransportChain {
                 Ok(available[0].0)
             }
             FailoverStrategy::RoundRobin => {
-                // Pick the channel that was least recently used
+                // Pick the channel with the longest time since last use (least recently used)
                 let idx = available.iter()
-                    .min_by_key(|(_, c)| c.last_success.map(|t| t.elapsed()).unwrap_or(std::time::Duration::MAX))
+                    .max_by_key(|(_, c)| c.last_success.map(|t| t.elapsed()).unwrap_or(std::time::Duration::MAX))
                     .map(|(i, _)| *i)
                     .unwrap_or(available[0].0);
                 Ok(idx)
@@ -63,7 +63,10 @@ impl TransportChain {
             FailoverStrategy::LowestLatency => {
                 let idx = available.iter()
                     .filter(|(_, c)| c.health == ChannelHealth::Healthy)
-                    .min_by(|(_, a), (_, b)| a.avg_latency_ms.partial_cmp(&b.avg_latency_ms).unwrap())
+                    .min_by(|(_, a), (_, b)| {
+                        a.avg_latency_ms.partial_cmp(&b.avg_latency_ms)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .or_else(|| available.first())
                     .map(|(i, _)| *i)
                     .unwrap_or(0);
