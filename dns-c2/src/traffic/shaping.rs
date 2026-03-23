@@ -110,9 +110,16 @@ impl TrafficProfile {
         };
 
         // Apply working hours modifier
+        // Cap off-hours sleep at 1 hour to allow periodic re-check of working hours
+        const MAX_OFF_HOURS_SLEEP: f64 = 3600.0;
         let secs = if let Some(wh) = &self.working_hours {
             if !is_working_hours(wh) {
-                secs / wh.off_hours_fraction // Sleep longer outside working hours
+                if wh.off_hours_fraction <= 0.0 {
+                    // Fraction of 0 means "completely silent" — sleep for max then re-check
+                    MAX_OFF_HOURS_SLEEP
+                } else {
+                    (secs / wh.off_hours_fraction).min(MAX_OFF_HOURS_SLEEP)
+                }
             } else {
                 secs
             }

@@ -49,9 +49,11 @@ pub async fn fetch_staged_payload(
     let raw = base64::engine::general_purpose::STANDARD.decode(&b64_combined)
         .map_err(|e| SelfUpdateError::Fetch(format!("base64: {e}")))?;
 
-    // Decrypt if key provided and metadata says encrypted
-    let data = if meta.encrypted && key.is_some() {
-        crate::crypto::decrypt(key.unwrap(), &raw)
+    // Decrypt if key provided. When a key is supplied, ALWAYS decrypt
+    // regardless of the metadata `encrypted` flag — the flag comes from
+    // untrusted DNS and an attacker could set it to false to bypass decryption.
+    let data = if let Some(k) = key {
+        crate::crypto::decrypt(k, &raw)
             .map_err(|e| SelfUpdateError::Fetch(format!("decrypt: {e}")))?
     } else {
         raw
