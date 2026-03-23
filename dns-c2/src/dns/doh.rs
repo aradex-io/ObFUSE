@@ -1,180 +1,143 @@
+//! DNS-over-HTTPS backend — implements `DnsBackend` for read operations
+//! by sending wire-format DNS queries over HTTPS to public resolvers.
+//!
+//! Write operations (create/update/delete) are not supported by DoH
+//! and return `DnsError::ApiError`. The `TransportChain` routes writes
+//! to API-capable channels automatically.
+
 use super::{DnsBackend, DnsError, TxtRecord};
+use crate::traffic::doh as doh_util;
 use async_trait::async_trait;
-use log::debug;
-use serde::Deserialize;
 
-/// DNS-over-HTTPS backend — routes C2 DNS queries through encrypted HTTPS,
-/// blending with legitimate DoH traffic on port 443.
-///
-/// Supported providers:
-///   - Cloudflare: https://cloudflare-dns.com/dns-query
-///   - Google:     https://dns.google/resolve
-///   - Quad9:      https://dns.quad9.net:5053/dns-query
-///
-/// Uses the JSON wire format (application/dns-json) for simplicity.
-/// The underlying DNS records are still managed by the Cloudflare API backend;
-/// DoH is used as a *query transport* on the agent side.
+/// DoH provider presets
+#[derive(Debug, Clone)]
 pub struct DoHBackend {
+    /// DoH endpoint URL (e.g. "https://cloudflare-dns.com/dns-query")
+    endpoint: String,
+    /// HTTP client (reused across queries)
     client: reqwest::Client,
-    doh_server: String,
-    /// Fallback Cloudflare API backend for write operations
-    api_backend: super::cloudflare::CloudflareBackend,
-}
-
-#[derive(Deserialize, Debug)]
-struct DoHResponse {
-    #[serde(rename = "Status")]
-    status: u32,
-    #[serde(rename = "Answer", default)]
-    answer: Vec<DoHAnswer>,
-}
-
-#[derive(Deserialize, Debug)]
-struct DoHAnswer {
-    #[allow(dead_code)]
-    name: String,
-    #[serde(rename = "type")]
-    record_type: u32,
-    data: String,
-}
-
-/// Well-known DoH providers
-pub enum DoHProvider {
-    Cloudflare,
-    Google,
-    Quad9,
-    Custom(String),
-}
-
-impl DoHProvider {
-    pub fn url(&self) -> &str {
-        match self {
-            DoHProvider::Cloudflare => "https://cloudflare-dns.com/dns-query",
-            DoHProvider::Google => "https://dns.google/resolve",
-            DoHProvider::Quad9 => "https://dns.quad9.net:5053/dns-query",
-            DoHProvider::Custom(url) => url,
-        }
-    }
-}
-
-impl std::str::FromStr for DoHProvider {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "cloudflare" | "cf" => Ok(DoHProvider::Cloudflare),
-            "google" => Ok(DoHProvider::Google),
-            "quad9" => Ok(DoHProvider::Quad9),
-            url if url.starts_with("https://") => Ok(DoHProvider::Custom(url.to_string())),
-            _ => Err(format!("unknown DoH provider: {s} (try: cloudflare, google, quad9, or https://...)")),
-        }
-    }
+    /// Pad queries to this size (0 = no padding)
+    pad_to: usize,
 }
 
 impl DoHBackend {
-    pub fn new(
-        doh_server: String,
-        cf_token: String,
-        cf_zone_id: String,
-    ) -> Self {
+    pub fn new(endpoint: &str) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .expect("Failed to create HTTP client");
-
-        let api_backend = super::cloudflare::CloudflareBackend::new(cf_token, cf_zone_id);
-
+            .unwrap_or_default();
         Self {
+            endpoint: endpoint.to_string(),
             client,
-            doh_server,
-            api_backend,
+            pad_to: 128,
         }
     }
 
-    /// Query TXT records via DoH JSON API
-    async fn doh_query_txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
-        let url = if self.doh_server.contains("dns.google") {
-            format!("{}?name={}&type=TXT", self.doh_server, name)
-        } else {
-            format!("{}?name={}&type=TXT", self.doh_server, name)
-        };
+    /// Cloudflare DoH (1.1.1.1)
+    pub fn cloudflare() -> Self {
+        Self::new("https://cloudflare-dns.com/dns-query")
+    }
 
-        debug!("DoH query: {}", url);
+    /// Google DoH (8.8.8.8)
+    pub fn google() -> Self {
+        Self::new("https://dns.google/dns-query")
+    }
 
-        let resp = self
-            .client
-            .get(&url)
-            .header("Accept", "application/dns-json")
+    /// Quad9 DoH (9.9.9.9)
+    pub fn quad9() -> Self {
+        Self::new("https://dns.quad9.net:5053/dns-query")
+    }
+
+    /// Query TXT records for a name via DoH POST (wire format, RFC 8484)
+    async fn query_txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        let pad = if self.pad_to > 0 { Some(self.pad_to) } else { None };
+        let query = doh_util::build_dns_query(name, pad);
+
+        let response = self.client
+            .post(&self.endpoint)
+            .header("Content-Type", "application/dns-message")
+            .header("Accept", "application/dns-message")
+            .body(query)
             .send()
             .await
-            .map_err(|e| DnsError::NetworkError(format!("DoH request failed: {e}")))?;
+            .map_err(|e| DnsError::NetworkError(format!("DoH POST failed: {e}")))?;
 
-        if !resp.status().is_success() {
-            return Err(DnsError::NetworkError(format!(
-                "DoH server returned {}",
-                resp.status()
+        if !response.status().is_success() {
+            return Err(DnsError::ApiError(format!(
+                "DoH server returned {}", response.status()
             )));
         }
 
-        let doh_resp: DoHResponse = resp
-            .json()
-            .await
-            .map_err(|e| DnsError::ApiError(format!("DoH JSON parse error: {e}")))?;
+        let body = response.bytes().await
+            .map_err(|e| DnsError::NetworkError(format!("DoH read body: {e}")))?;
 
-        if doh_resp.status != 0 {
-            // RCODE != NOERROR
-            return Ok(vec![]);
-        }
-
-        // TXT record type = 16
-        let txt_values: Vec<String> = doh_resp
-            .answer
-            .into_iter()
-            .filter(|a| a.record_type == 16)
-            .map(|a| {
-                // DoH returns TXT data with surrounding quotes
-                a.data.trim_matches('"').to_string()
-            })
-            .collect();
-
-        Ok(txt_values)
+        doh_util::parse_dns_response(&body)
+            .map_err(|e| DnsError::ApiError(format!("DoH parse: {e}")))
     }
 }
 
 #[async_trait]
 impl DnsBackend for DoHBackend {
-    /// Write operations go through the Cloudflare API
-    async fn create_record(
-        &self,
-        name: &str,
-        content: &str,
-        ttl: u32,
-    ) -> Result<String, DnsError> {
-        self.api_backend.create_record(name, content, ttl).await
+    async fn create_record(&self, _name: &str, _content: &str, _ttl: u32) -> Result<String, DnsError> {
+        Err(DnsError::ApiError("DoH is read-only — writes require an API-capable channel".into()))
     }
 
-    /// Read operations go through DoH for stealth
     async fn get_records(&self, name: &str) -> Result<Vec<TxtRecord>, DnsError> {
-        let values = self.doh_query_txt(name).await?;
-        Ok(values
-            .into_iter()
-            .map(|content| TxtRecord {
-                name: name.to_string(),
-                content,
-                id: None, // DoH doesn't return record IDs
-            })
-            .collect())
+        let texts = self.query_txt(name).await?;
+        Ok(texts.into_iter().map(|content| TxtRecord {
+            name: name.to_string(),
+            content,
+            id: None,
+        }).collect())
     }
 
-    async fn update_record(&self, id: &str, content: &str) -> Result<(), DnsError> {
-        self.api_backend.update_record(id, content).await
+    async fn update_record(&self, _id: &str, _content: &str) -> Result<(), DnsError> {
+        Err(DnsError::ApiError("DoH is read-only — writes require an API-capable channel".into()))
     }
 
-    async fn delete_record(&self, id: &str) -> Result<(), DnsError> {
-        self.api_backend.delete_record(id).await
+    async fn delete_record(&self, _id: &str) -> Result<(), DnsError> {
+        Err(DnsError::ApiError("DoH is read-only — writes require an API-capable channel".into()))
     }
 
-    async fn list_records(&self, prefix: &str) -> Result<Vec<TxtRecord>, DnsError> {
-        // List operations require the API (DoH can't enumerate)
-        self.api_backend.list_records(prefix).await
+    async fn list_records(&self, _prefix: &str) -> Result<Vec<TxtRecord>, DnsError> {
+        // DoH can't enumerate records — only query specific names
+        Err(DnsError::ApiError("DoH cannot list records — use an API-capable channel".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_doh_backend_creation() {
+        let backend = DoHBackend::cloudflare();
+        assert_eq!(backend.endpoint, "https://cloudflare-dns.com/dns-query");
+    }
+
+    #[test]
+    fn test_google_backend() {
+        let backend = DoHBackend::google();
+        assert_eq!(backend.endpoint, "https://dns.google/dns-query");
+    }
+
+    #[test]
+    fn test_quad9_backend() {
+        let backend = DoHBackend::quad9();
+        assert!(backend.endpoint.contains("quad9"));
+    }
+
+    #[tokio::test]
+    async fn test_create_record_fails() {
+        let backend = DoHBackend::cloudflare();
+        let result = backend.create_record("test", "data", 60).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_records_fails() {
+        let backend = DoHBackend::cloudflare();
+        let result = backend.list_records("_c2.").await;
+        assert!(result.is_err());
     }
 }

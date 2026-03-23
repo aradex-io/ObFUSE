@@ -2,6 +2,7 @@ pub mod cloudflare;
 pub mod doh;
 pub mod local;
 pub mod mock;
+pub mod multi;
 pub mod retry;
 
 use async_trait::async_trait;

