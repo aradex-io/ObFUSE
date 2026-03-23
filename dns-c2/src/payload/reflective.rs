@@ -234,8 +234,8 @@ pub fn generate_reflective_loader(
         elf_size: elf_data.len() as u64,
         entry_offset: info.entry_offset,
         total_map_size: info.total_mapping_size,
-        num_segments: info.segments.len() as u32,
-        // Segment descriptors follow
+        // Only PT_LOAD segments are serialized — count must match
+        num_segments: info.segments.iter().filter(|s| s.seg_type == 1).count() as u32,
         segments: info.segments.iter()
             .filter(|s| s.seg_type == 1) // PT_LOAD only
             .cloned()

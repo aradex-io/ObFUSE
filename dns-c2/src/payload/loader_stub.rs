@@ -189,7 +189,55 @@ fn generate_x64_stub(meta_size: usize) -> Vec<u8> {
     // mov r13, rax  ; r13 = mapped base
     sc.extend_from_slice(&[0x49, 0x89, 0xC5]);
 
-    // -- Copy segments loop --
+    // -- Check mmap result --
+    // cmp rax, -1 (MAP_FAILED)
+    sc.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFF]);
+    // jne mmap_ok (skip exit)
+    sc.extend_from_slice(&[0x75, 0x0C]);
+    // mmap failed — exit(1)
+    sc.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    sc.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    sc.extend_from_slice(&[0x0F, 0x05]);                                 // syscall
+    // mmap_ok:
+
+    // -- XOR decrypt source ELF data in-place BEFORE copying (if xor_key != 0) --
+    // movzx eax, byte [r12+28]  ; xor_key
+    sc.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x44, 0x24, 0x1C]);
+    // test al, al
+    sc.extend_from_slice(&[0x84, 0xC0]);
+    // jz skip_xor (placeholder)
+    let jz_xor_patch = sc.len();
+    sc.extend_from_slice(&[0x74, 0x00]);
+
+    // XOR the source ELF blob (r14, elf_data_size bytes) in-place
+    // mov rdi, r14              ; source ELF data pointer
+    sc.extend_from_slice(&[0x4C, 0x89, 0xF7]);
+    // mov ecx, [r12+24]         ; elf_data_size (u32)
+    sc.extend_from_slice(&[0x41, 0x8B, 0x4C, 0x24, 0x18]);
+    // xor_loop:
+    let xor_loop = sc.len();
+    // test ecx, ecx
+    sc.extend_from_slice(&[0x85, 0xC9]);
+    // jz xor_done
+    let jz_xor_done = sc.len();
+    sc.extend_from_slice(&[0x74, 0x00]);
+    // xor [rdi], al
+    sc.extend_from_slice(&[0x30, 0x07]);
+    // inc rdi
+    sc.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+    // dec ecx
+    sc.extend_from_slice(&[0xFF, 0xC9]);
+    // jmp xor_loop
+    let jmp_xor = xor_loop as i32 - (sc.len() + 2) as i32;
+    sc.extend_from_slice(&[0xEB, jmp_xor as u8]);
+
+    let xor_done = sc.len();
+    sc[jz_xor_done + 1] = (xor_done - jz_xor_done - 2) as u8;
+
+    let skip_xor = sc.len();
+    sc[jz_xor_patch + 1] = (skip_xor - jz_xor_patch - 2) as u8;
+
+    // -- Copy segments loop (source is now decrypted) --
     // rbx = segment index counter
     // xor ebx, ebx
     sc.extend_from_slice(&[0x31, 0xDB]);
@@ -203,7 +251,6 @@ fn generate_x64_stub(meta_size: usize) -> Vec<u8> {
     sc.extend_from_slice(&[0x7D, 0x00]); // patched below
 
     // Calculate segment descriptor address: r12 + 32 + rbx*40
-    // lea rax, [rbx*8]  — we need rbx*40 = rbx*8*5
     // imul rax, rbx, 40
     sc.extend_from_slice(&[0x48, 0x6B, 0xC3, 40]);
     // lea rsi, [r12 + rax + 32]  ; rsi = &seg_desc[rbx]
@@ -216,14 +263,14 @@ fn generate_x64_stub(meta_size: usize) -> Vec<u8> {
     sc.extend_from_slice(&[0x48, 0x8B, 0x56, 0x08]);
     // mov r8, [rsi+16]   ; filesz
     sc.extend_from_slice(&[0x4C, 0x8B, 0x46, 0x10]);
-    // mov r9, [rsi+24]   ; memsz (not directly used for copy, but for mprotect later)
+    // mov r9, [rsi+24]   ; memsz (for mprotect later)
     sc.extend_from_slice(&[0x4C, 0x8B, 0x4E, 0x18]);
 
     // Destination: r13 + vaddr
     // lea rdi, [r13 + rcx]
     sc.extend_from_slice(&[0x49, 0x8D, 0x7C, 0x0D, 0x00]);
     // Source: r14 + file_offset
-    // lea rsi, [r14 + rdx]  (clobbers rsi but we're done with seg desc)
+    // lea rsi, [r14 + rdx]
     sc.extend_from_slice(&[0x49, 0x8D, 0x34, 0x16]);
     // Count: r8 = filesz
     // mov rcx, r8
@@ -242,43 +289,6 @@ fn generate_x64_stub(meta_size: usize) -> Vec<u8> {
     let loop_end = sc.len();
     // Patch the jge
     sc[jge_patch + 1] = (loop_end - jge_patch - 2) as u8;
-
-    // -- XOR decrypt (if xor_key != 0) --
-    // movzx eax, byte [r12+28]  ; xor_key
-    sc.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x44, 0x24, 0x1C]);
-    // test al, al
-    sc.extend_from_slice(&[0x84, 0xC0]);
-    // jz skip_xor (placeholder)
-    let jz_xor_patch = sc.len();
-    sc.extend_from_slice(&[0x74, 0x00]);
-
-    // XOR the entire mapped region
-    // mov rdi, r13        ; base
-    sc.extend_from_slice(&[0x4C, 0x89, 0xEF]);
-    // mov rcx, [r12+0]    ; total_map_size
-    sc.extend_from_slice(&[0x49, 0x8B, 0x0C, 0x24]);
-    // xor_loop:
-    let xor_loop = sc.len();
-    // test rcx, rcx
-    sc.extend_from_slice(&[0x48, 0x85, 0xC9]);
-    // jz xor_done
-    let jz_xor_done = sc.len();
-    sc.extend_from_slice(&[0x74, 0x00]);
-    // xor [rdi], al
-    sc.extend_from_slice(&[0x30, 0x07]);
-    // inc rdi
-    sc.extend_from_slice(&[0x48, 0xFF, 0xC7]);
-    // dec rcx
-    sc.extend_from_slice(&[0x48, 0xFF, 0xC9]);
-    // jmp xor_loop
-    let jmp_xor = xor_loop as i32 - (sc.len() + 2) as i32;
-    sc.extend_from_slice(&[0xEB, jmp_xor as u8]);
-
-    let xor_done = sc.len();
-    sc[jz_xor_done + 1] = (xor_done - jz_xor_done - 2) as u8;
-
-    let skip_xor = sc.len();
-    sc[jz_xor_patch + 1] = (skip_xor - jz_xor_patch - 2) as u8;
 
     // -- mprotect loop for each segment --
     // xor ebx, ebx

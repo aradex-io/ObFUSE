@@ -140,9 +140,10 @@ fn gen_x64_anti_debug() -> Vec<u8> {
         0x4D, 0x31, 0xD2,                            // xor r10, r10
         0x0F, 0x05,                                  // syscall
         0x48, 0x85, 0xC0,                            // test rax, rax
-        0x79, 0x05,                                  // jns +5 (skip exit if OK)
-        0x48, 0x31, 0xFF,                            // xor rdi, rdi
-        0x0F, 0x05,                                  // syscall (exit with whatever rax is)
+        0x79, 0x0C,                                  // jns +12 (skip exit if OK)
+        0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,  // mov rax, 60 (sys_exit)
+        0x48, 0x31, 0xFF,                            // xor rdi, rdi (exit code 0)
+        0x0F, 0x05,                                  // syscall (exit)
         // If ptrace succeeded, detach
         0x48, 0xC7, 0xC0, 0x65, 0x00, 0x00, 0x00,  // mov rax, 101 (ptrace)
         0x48, 0xC7, 0xC7, 0x11, 0x00, 0x00, 0x00,  // mov rdi, 17 (PTRACE_DETACH)

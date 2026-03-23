@@ -112,6 +112,14 @@ impl std::str::FromStr for CradleTransport {
     }
 }
 
+/// Validate a DNS label/domain component for safe use in shell commands.
+/// Allows only alphanumeric, hyphens, dots, and underscores.
+fn sanitize_dns_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+        .collect()
+}
+
 fn meta_record_name(label: &str, domain: &str) -> String {
     format!("_s.meta.{label}.{domain}")
 }
@@ -222,13 +230,19 @@ pub fn generate_cradle_ext(
     shell: Shell, domain: &str, label: &str, meta: &StageMeta,
     ns_server: Option<&str>, transport: CradleTransport, key_hex: Option<&str>,
 ) -> String {
+    if meta.chunks == 0 {
+        return "# Error: staged payload has 0 chunks".to_string();
+    }
     let n = meta.chunks - 1;
     let is_binary = matches!(meta.payload_type, PayloadType::Elf | PayloadType::Pe);
+    // Sanitize domain/label to prevent shell injection in generated one-liners
+    let safe_domain = sanitize_dns_name(domain);
+    let safe_label = sanitize_dns_name(label);
     match (shell, transport) {
-        (Shell::Bash, CradleTransport::Dig) => gen_bash(domain, label, n, is_binary, ns_server, key_hex),
-        (Shell::Bash, CradleTransport::DoH) => gen_bash_doh(domain, label, n, is_binary, key_hex),
-        (Shell::Pwsh, _) => gen_pwsh(domain, label, n, is_binary, meta.payload_type, ns_server),
-        (Shell::Cmd, _) => gen_cmd(domain, label, n, is_binary, meta.payload_type, ns_server),
+        (Shell::Bash, CradleTransport::Dig) => gen_bash(&safe_domain, &safe_label, n, is_binary, ns_server, key_hex),
+        (Shell::Bash, CradleTransport::DoH) => gen_bash_doh(&safe_domain, &safe_label, n, is_binary, key_hex),
+        (Shell::Pwsh, _) => gen_pwsh(&safe_domain, &safe_label, n, is_binary, meta.payload_type, ns_server),
+        (Shell::Cmd, _) => gen_cmd(&safe_domain, &safe_label, n, is_binary, meta.payload_type, ns_server),
     }
 }
 

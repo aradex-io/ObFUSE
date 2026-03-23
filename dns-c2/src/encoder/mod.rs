@@ -183,9 +183,14 @@ fn apply_pass(pass: &EncoderPass, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Enc
 
 fn reverse_pass(pass: &EncoderPass, data: &[u8], key: &[u8]) -> Result<Vec<u8>, EncoderError> {
     match pass {
-        EncoderPass::XorRolling { .. } | EncoderPass::XorDerived { .. } => {
-            // XOR is its own inverse
+        EncoderPass::XorRolling { .. } => {
+            // XOR is its own inverse with the same key
             Ok(xor::xor_rolling(data, key))
+        }
+        EncoderPass::XorDerived { .. } => {
+            // key is the seed — re-derive the full-length key for decode
+            let derived = xor::derive_xor_key(key, data.len());
+            Ok(xor::xor_rolling(data, &derived))
         }
         EncoderPass::Substitution => {
             Ok(poly::substitution_decode(data, key))

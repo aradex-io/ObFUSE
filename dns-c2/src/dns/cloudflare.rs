@@ -106,7 +106,15 @@ impl DnsBackend for CloudflareBackend {
 
     async fn get_records(&self, name: &str) -> Result<Vec<TxtRecord>, DnsError> {
         let (header_name, header_val) = self.auth_header();
-        let url = format!("{}&type=TXT&name={}", self.api_url("/dns_records?per_page=100"), name);
+        // URL-encode the name to prevent query parameter injection
+        let encoded_name: String = name.bytes().map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' {
+                (b as char).to_string()
+            } else {
+                format!("%{:02X}", b)
+            }
+        }).collect();
+        let url = format!("{}&type=TXT&name={}", self.api_url("/dns_records?per_page=100"), encoded_name);
         debug!("GET {}", url);
 
         let resp = self.client.get(&url)
@@ -161,6 +169,9 @@ impl DnsBackend for CloudflareBackend {
             .map_err(|e| DnsError::NetworkError(e.to_string()))?;
 
         if resp.status() == 429 { return Err(DnsError::RateLimited); }
+        if !resp.status().is_success() {
+            return Err(DnsError::ApiError(format!("delete failed: HTTP {}", resp.status())));
+        }
         Ok(())
     }
 
