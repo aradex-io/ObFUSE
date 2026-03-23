@@ -69,6 +69,18 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfLoadInfo, PayloadError> {
     let phentsize = u16::from_le_bytes(data[0x36..0x38].try_into().unwrap());
     let phnum = u16::from_le_bytes(data[0x38..0x3A].try_into().unwrap());
 
+    // Validate phoff and phentsize are sane before iterating
+    let phoff_usize = phoff as usize;
+    let phentsize_usize = phentsize as usize;
+    if phentsize_usize < 56 {
+        return Err(PayloadError::InvalidBinary(
+            format!("phentsize too small: {phentsize_usize} (need >= 56)")));
+    }
+    if phoff_usize > data.len() {
+        return Err(PayloadError::InvalidBinary(
+            format!("phoff {phoff_usize:#x} beyond file size {}", data.len())));
+    }
+
     let mut segments = Vec::new();
     let mut min_vaddr = u64::MAX;
     let mut max_vaddr = 0u64;
@@ -77,9 +89,11 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfLoadInfo, PayloadError> {
     let mut dynamic_size = 0u64;
 
     for i in 0..phnum as usize {
-        let ph = phoff as usize + i * phentsize as usize;
-        if ph + phentsize as usize > data.len() {
-            break;
+        let ph = phoff_usize.checked_add(i.checked_mul(phentsize_usize).unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX);
+        if ph + phentsize_usize > data.len() {
+            return Err(PayloadError::InvalidBinary(
+                format!("program header {i} at offset {ph:#x} extends beyond file")));
         }
 
         let p_type = u32::from_le_bytes(data[ph..ph + 4].try_into().unwrap());

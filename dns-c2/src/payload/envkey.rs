@@ -45,8 +45,17 @@ impl EnvKeyMaterial {
         }
     }
 
-    /// Derive a 256-bit key from the environment properties
+    /// Returns true if at least one binding property is set
+    pub fn has_bindings(&self) -> bool {
+        self.hostname.is_some() || self.username.is_some()
+            || self.mac_address.is_some() || self.machine_id.is_some()
+            || self.custom_salt.is_some()
+    }
+
+    /// Derive a 256-bit key from the environment properties.
+    /// Panics if no binding properties are set (use has_bindings() to check).
     pub fn derive_key(&self, master_key: &EncryptionKey) -> EncryptionKey {
+        assert!(self.has_bindings(), "EnvKeyMaterial must have at least one binding property");
         let mut hasher = blake3::Hasher::new_keyed(master_key);
         hasher.update(b"obfuse-envkey-v1:");
         if let Some(ref h) = self.hostname {
@@ -129,12 +138,17 @@ fn get_username() -> Option<String> {
 fn get_mac_address() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        // Read from /sys/class/net/*/address, skip lo
+        // Read from /sys/class/net/*/address, skip lo.
+        // Sort interface names for deterministic selection across reboots.
         if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name == "lo" { continue; }
-                let path = entry.path().join("address");
+            let mut ifaces: Vec<String> = entries.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name != "lo")
+                .collect();
+            ifaces.sort();
+
+            for name in ifaces {
+                let path = std::path::Path::new("/sys/class/net").join(&name).join("address");
                 if let Ok(mac) = std::fs::read_to_string(&path) {
                     let mac = mac.trim().to_string();
                     if !mac.is_empty() && mac != "00:00:00:00:00:00" {

