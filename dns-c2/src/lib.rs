@@ -4,6 +4,7 @@ pub mod cradle;
 pub mod crypto;
 pub mod dns;
 pub mod encoder;
+pub mod encoding;
 pub mod evasion;
 pub mod exec;
 pub mod payload;

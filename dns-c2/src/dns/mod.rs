@@ -1,4 +1,5 @@
 pub mod cloudflare;
+pub mod doh;
 pub mod local;
 pub mod mock;
 pub mod retry;

